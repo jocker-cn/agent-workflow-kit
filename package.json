@@ -6,14 +6,13 @@
   "type": "module",
   "scripts": {
     "workflow": "node ./src/workflowctl.mjs",
-    "check": "node ./src/workflowctl.mjs help",
+    "cachectl": "node ./src/cachectl.mjs",
+    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs",
     "test": "node --test",
     "browser": "playwright-cli",
     "browser:help": "playwright-cli --help",
     "browser:install": "playwright-cli install",
-    "browser:install-browser": "playwright-cli install-browser chromium",
-    "browser:fill-secret": "node ./src/browser/fill-secret.mjs",
-    "browser:wait": "node ./src/browser/wait-for-snapshot.mjs"
+    "browser:install-browser": "playwright-cli install-browser chromium"
   },
   "engines": {
     "node": ">=20"
@@ -22,7 +21,5 @@
   "devDependencies": {
     "@playwright/cli": "^0.1.17"
   },
-  "dependencies": {
-    "yaml": "^2.9.0"
-  }
+  "dependencies": {}
 }

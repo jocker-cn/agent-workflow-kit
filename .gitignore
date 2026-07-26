@@ -1,4 +1,6 @@
 .workflow-runs/
+.workflow-cache/
+node_modules/
 .playwright-cli/
 playwright-cli/
 .playwright/

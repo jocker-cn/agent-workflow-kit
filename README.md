@@ -1,140 +1,152 @@
 # Agent Workflow Kit
 
-一个由 Copilot Agent 通过 Prompt 驱动的企业工作流基础项目。当前内置的第一个 workflow 是 CR 自动化；后续可用相同模式扩展 Jira 变更、发布检查、报告收集、运维巡检或其他浏览器流程。
+让 Copilot Agent 直接执行用户用自然语言描述的浏览器流程。
 
-它不包含任何公司网址、账号或页面 selector。每一种 workflow 由 Skill 定义 Agent 操作方法，并由 `workflows/<id>/workflow.yaml` 定义阶段、必填事实、证据和确认 gate；Agent 使用 `playwright-cli` 观察当前页面并完成操作。`workflowctl` 负责保存可恢复的运行状态、证据和提交前摘要。
+用户不需要新增项目目录、业务 Skill、YAML、selector 或脚本。项目只提供：
 
-## 扩展新 workflow
+- 项目本地的官方 Playwright CLI Skill，负责观察页面和操作浏览器；
+- `AGENTS.md`，负责通用执行规则、安全边界和人工步骤衔接；
+- 按 Prompt 隔离的流程定义与页面操作缓存；
+- 面向跨 Copilot 会话恢复的通用执行状态。
 
-新增一个流程时，不需要改动浏览器自动化模式：新增一个 Skill 与对应 workflow contract，定义该流程的阶段、必需证据和确认点；仅在确实存在跨 workflow 的新能力时才扩展 `src/`。
+## 一次性准备
+
+```bash
+pnpm install
+pnpm browser install --skills agents
+```
+
+然后在项目目录中打开 Copilot Agent，直接描述任务。例如：
 
 ```text
-skills/
-  cr-automation/       # 当前：Jenkins → CR → pipeline
-  bilibili-video-metrics/ # 示例：短信登录 → 热搜 → 视频指标
-workflows/
-  change-request/      # README + workflow.yaml
-  bilibili-video-metrics/ # README + workflow.yaml
+打开 B 站，使用短信登录。手机号从环境变量 BILIBILI_PHONE 读取，
+验证码由我在浏览器中手动输入；检测到登录成功后自动继续。
+选择热搜第三项进行搜索，打开第一个实际视频，
+返回视频链接、点赞、投币、收藏、分享和评论数量。
+整个过程只读取信息，不要点赞、投币、收藏、分享或评论。
 ```
 
-每个 Skill 都遵循同一工作循环：浏览器 snapshot → Agent 决策 → 基于当前 ref 操作 → 保存运行状态与证据。页面实现细节不应写入 Skill。
-
-## 前置条件
-
-- Node.js 20+
-- 已通过项目本地依赖固定 Playwright CLI 版本；首次使用时初始化官方 Agent Skill：
-
-  ```bash
-  pnpm install
-  pnpm browser install --skills agents
-  ```
-
-- 本地浏览器能够通过公司的 Windows / 浏览器集成自动登录 Jenkins 和 CR 系统。
-
-浏览器命令一律通过 `pnpm browser ...` 调用，这样所有使用者都采用 `pnpm-lock.yaml` 中锁定的 CLI 版本。完整说明见 [docs/playwright-cli.md](docs/playwright-cli.md)。
-
-官方 Skill 安装到 `.agents/skills/playwright-cli/`，负责通用的快照、ref、会话与标签页操作。`skills/` 下的文件只保留业务规则和 workflow 状态约束，避免每个新流程重复浏览器基础操作。
-
-如果 CLI 启动的新浏览器不能复用登录态，先验证 `playwright-cli attach --cdp=chrome` 或浏览器扩展附着方式；不要把 Cookie、密码或 token 写入本仓库。
-
-## 快速开始
-
-```bash
-cd D:/code/copilotkit/agent-workflow-kit
-pnpm workflow init --workflow change-request --summary "修复支付回调重试问题" \
-  --input service=payment-service --input environment=production --input branch=main
-pnpm workflow show --run <run-id>
-```
-
-## Playwright CLI 使用
-
-先在受管浏览器环境中做一次非生产验证：
-
-```bash
-# 打开浏览器（将 URL 改成公司允许测试的地址）
-pnpm browser open https://example.com --headed
-
-# 获取当前页面的可操作元素；Agent 根据当前 ref 决定下一步
-pnpm browser snapshot
-
-# 截图、查看会话、关闭会话
-pnpm browser screenshot
-pnpm browser list
-pnpm browser close
-```
-
-不要将登录态、Cookie 或浏览器 profile 提交到 Git。若 CLI 启动的浏览器不能使用公司的自动登录机制，先验证附着到已登录浏览器的方式，再进行真实业务操作。
-
-将本项目的 `skills/cr-automation/SKILL.md` 放到 Copilot 可读取的 Skill 目录，或将其内容纳入你们公司的 Agent Skill。之后可用类似 Prompt：
+或者：
 
 ```text
-为 payment-service 的 main 分支创建生产 CR。
-变更内容：修复支付回调的重试问题。
-按 CR Automation Skill 执行；创建 pipeline 后先展示预览，不要提交。
+为 payment-service 的 main 分支执行发布 CR 流程：
+先在 Jenkins 打包，记录镜像版本、Sonar 和 FOSS 报告；
+再创建 CR、填写打包信息并创建 pipeline。
+提交审批前展示汇总并等待我确认。
 ```
 
-## 运行状态
+Agent 会自行把 Prompt 转成动态执行步骤、读取当前页面、判断条件分支并选择合适命令。流程变化时直接修改 Prompt，不需要同步修改代码。
 
-每次运行的数据写入 `.workflow-runs/<run-id>/`，默认被 Git 忽略：
+## 目录职责
 
 ```text
-.workflow-runs/<run-id>/
-  state.json       # 当前阶段和结构化业务数据
-  evidence.jsonl   # URL、截图、快照、控制台摘录等证据索引
-  review.md        # 提交前可读摘要
+.agents/skills/playwright-cli/  官方 Playwright CLI Skill
+.github/prompts/                用户维护的自然语言流程
+.workflow-cache/                Agent 自动学习的 Prompt 专属缓存
+.workflow-runs/                 每次执行的状态与断点
+AGENTS.md                       所有流程共用的 Agent 规则
+src/                            通用运行时工具
+docs/                           安装与排障说明
 ```
 
-常用命令：
+流程步骤、业务事实、策略、输出要求和限制都来自用户当前的 Prompt；新增流程不需要修改项目目录。
+
+## 执行状态与断点恢复
+
+对于跨 Web 系统流程，Agent 会在后台维护一个独立 run。用户不需要在 Prompt 中编排下面的命令；这里展示它们只是为了说明恢复机制。
 
 ```bash
-# 查看状态
-pnpm workflow show --run <run-id>
+# 保存一个可恢复的运行记录
+pnpm workflow init \
+  --summary "处理订单 A" \
+  --intent "读取订单类型；实物订单走仓储流程，虚拟订单走许可证流程；更新订单前等待确认" \
+  --prompt-key <prompt-key> \
+  --name order-processing \
+  --input order.id=A
 
-# 推进阶段（只能按流程前进）
-pnpm workflow phase --run <run-id> --to BUILD
+# Agent 从 Prompt 生成初始计划
+pnpm workflow plan-add --run <run-id> \
+  --id inspect-order --title "读取订单类型"
 
-# 记录构建/报告/CR/pipeline 字段
-pnpm workflow set --run <run-id> --key build.number --value 421
-pnpm workflow set --run <run-id> --key build.image --value registry.example/payment-service:2026.07.24-421
+# 页面显示订单 A 是实物订单
+pnpm workflow fact --run <run-id> \
+  --key order.type --value physical --source "订单详情页"
+pnpm workflow decision --run <run-id> \
+  --name order-route --selected warehouse \
+  --condition "order.type is physical" \
+  --reason "订单详情页显示为实物订单"
 
-# 记录截图、快照、URL 或文字证据
-pnpm workflow evidence --run <run-id> --kind screenshot --value D:/safe/path/before-submit.png
+# Agent 动态加入当前分支的步骤并保存恢复位置
+pnpm workflow plan-add --run <run-id> \
+  --id check-inventory --title "检查库存" --after inspect-order
+pnpm workflow checkpoint --run <run-id> \
+  --step check-inventory \
+  --next "在仓储系统查询订单 A 的库存" \
+  --system warehouse \
+  --url "https://warehouse.example/..."
 
-# 生成提交前摘要；通过后写入明确确认标记
-pnpm workflow review --run <run-id>
-pnpm workflow confirm --run <run-id> --action submit --by "Joker"
+# 使用同一个 run id 操作可见浏览器
+pnpm browser -s=<run-id> open <url> --headed
+
+# 新会话根据业务变量精确找回未完成的 run
+pnpm workflow latest --name order-processing --input order.id=A
+pnpm workflow context --run <run-id>
 ```
 
-对于短信验证码、人工检查等需要人完成的页面步骤，不要结束 Agent 再要求用户发送“已完成”。将 run 标记为等待状态，并由本地 Playwright CLI 轮询可见页面状态；检测到预期状态后在同一任务中继续：
+`context` 会为新的 Copilot 会话输出恢复所需的目标、输入、计划、事实、分支决策、当前步骤、下一动作、等待状态、结果和确认记录。新的 Agent 随后重新观察浏览器页面并继续；不会复用已经失效的 element ref。
+
+同一套流程处理订单 A 和订单 B 时，Agent 会创建两个相互隔离的 run。Prompt 中随每次执行变化的订单号、服务、分支、环境等保存为该 run 的输入；运行过程中从 Web 系统取得的编号、版本和报告结果保存为该 run 的数据，不会从其他 run 继承。
+
+状态采用类似 n8n Execution 的思想，但没有固定节点图：Prompt 是流程定义，Agent 动态维护 `plan`；页面发现的业务属性进入 `facts`；条件分支进入 `decisions`；跨系统结果进入 `outputs`；`cursor` 保存断点。
+
+运行记录位于 `.workflow-runs/`，默认不会提交到 Git。密码、验证码和人工步骤如何处理，由对应业务 Prompt 决定；项目不提供统一业务策略或浏览器命令包装脚本。
+
+## Prompt 专属缓存
+
+每个 Prompt 文件根据“文件身份 + 内容哈希”获得独立缓存：
+
+```text
+.workflow-cache/
+├── definitions/
+│   └── <prompt-key>/
+│       └── <prompt-hash>.json
+└── pages/
+    └── <prompt-key>/
+        └── <prompt-hash>/
+            └── <page-id>.json
+```
+
+- 同一个 Prompt、不同订单或资源变量：共享缓存，run 相互隔离；
+- 不同 Prompt：缓存完全隔离；
+- Prompt 内容改变：自动创建新版本，不复用旧版本；
+- 缓存由 Agent 自动生成，用户只维护自然语言 Prompt；
+- snapshot ref、凭据、验证码和本次业务变量不会写入缓存。
+
+首次执行时，Agent 解析 Prompt、探索页面并学习稳定操作：
 
 ```bash
-pnpm workflow pause --run <run-id> --reason "等待短信验证"
-pnpm browser:wait --session <run-id> --present "已登录后的可见标识" --absent "登录" --timeout-ms 600000
-pnpm workflow resume --run <run-id>
+pnpm cachectl list
+pnpm cachectl prepare --prompt-key <prompt-key>
+pnpm cachectl definition-step --prompt-key <prompt-key> \
+  --id inspect-order --title "读取订单类型"
+pnpm cachectl page-init --prompt-key <prompt-key> \
+  --page order-details --origin "https://orders.example" \
+  --route "/orders/*" --title "订单详情" --anchor "订单类型"
+pnpm cachectl action-learn --prompt-key <prompt-key> \
+  --page order-details --name open-order \
+  --strategy locator --target "getByRole('link', { name: '订单详情' })" \
+  --postcondition "订单详情标题可见"
 ```
 
-若等待超时，run 会保留为 `waiting`，后续可恢复而不需要记住 run id：
+后续执行先验证页面指纹，再通过 `--raw` 使用缓存 locator，并验证后置条件。缓存失败时，Agent 先截图，再按需读取局部 snapshot，学习新的 locator 并回写缓存；成功路径不再反复读取完整页面结构。
 
-```bash
-pnpm workflow latest --workflow <workflow-id>
-pnpm workflow show --run <run-id>
-```
+使用 `prompt-key` 是为了避免 Windows shell 对包含中文、空格的 Prompt 路径进行错误拆分。Prompt 文件名和正文不需要因此修改。
 
-`confirm` 只记录用户已确认；它绝不会提交网页。真正点击 CR 的提交按钮仍由 Agent 在确认后用 `playwright-cli` 完成，并记录结果。
-
-## 项目知识
-
-在 `knowledge/` 下为每个服务保存稳定的业务知识，例如 Jenkins job 命名、报告常见术语和风险限制。不要保存 CSS selector、元素 ref、Cookie 或密码。可从 `knowledge/example-service.md` 复制。
-
-## Bilibili 测试 workflow
-
-`skills/bilibili-video-metrics/` 是一个独立 workflow 模块，不是独立项目。它会在用户手动完成短信验证码后，搜索当前热搜第一项并打印首个视频的公开指标。执行说明见 [workflows/bilibili-video-metrics/README.md](workflows/bilibili-video-metrics/README.md)。
+浏览器安装、会话和排障细节见 [docs/playwright-cli.md](docs/playwright-cli.md)。
 
 ## 验证
 
 ```bash
+pnpm test
 pnpm check
-pnpm workflow init --workflow example --summary "验证状态文件" --input environment=test --input branch=main
 ```
-
-第二条命令会创建一个本地 run；测试完成后可手动删除对应 `.workflow-runs/<run-id>` 目录。

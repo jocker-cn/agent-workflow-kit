@@ -1,5 +1,0 @@
-
-> agent-workflow-kit@0.1.0 workflow D:\code\copilotkit\agent-workflow-kit
-> node ./src/workflowctl.mjs "phase" "--run" "workflow" "D:codecopilotkitagent-workflow-kit" "./src/workflowctl.mjs" "latest" "--workflow" "bilibili-video-metrics" "20260724-bilibili-video-metrics-a6bce2" "--to" "LOGIN"
-
- ELIFECYCLE  Command failed with exit code 1.
