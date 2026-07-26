@@ -94,9 +94,11 @@ export async function ensurePromptCache(identity) {
   if (!existsSync(paths.definitionPath)) {
     const now = new Date().toISOString();
     await atomicWriteJson(paths.definitionPath, {
-      schemaVersion: 1,
+      schemaVersion: 2,
       prompt: identity,
       compiled: {
+        version: 1,
+        nodes: [],
         steps: [],
         branches: [],
       },
@@ -116,4 +118,93 @@ export function cacheDisplayPaths(paths) {
 
 export function candidateId(strategy, target) {
   return `candidate-${sha256(`${strategy}\0${target}`).slice(0, 12)}`;
+}
+
+export function routeSignature(when = {}) {
+  const entries = Object.entries(when)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${value}`);
+  return entries.length === 0 ? 'default' : entries.join(';');
+}
+
+export function normalizeDefinition(definition) {
+  definition.schemaVersion ??= 1;
+  definition.compiled ??= {};
+  definition.compiled.version ??= 1;
+  definition.compiled.nodes ??= [];
+  definition.compiled.steps ??= [];
+  definition.compiled.branches ??= [];
+  return definition;
+}
+
+function nestedValue(values, dottedKey) {
+  return dottedKey.split('.').reduce((current, part) => current?.[part], values);
+}
+
+export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) {
+  const resolved = [];
+  const pending = [];
+  const unknown = [];
+  const ambiguous = [];
+  for (const node of normalizeDefinition(definition).compiled.nodes) {
+    if (onlyNode && node.id !== onlyNode) continue;
+    const enabled = node.routes.filter((route) => route.status !== 'disabled');
+    const conditional = enabled.filter((route) => Object.keys(route.when).length > 0);
+    const candidates = (conditional.length > 0 ? conditional : enabled)
+      .filter((route) => Object.entries(route.when)
+        .every(([key, expected]) => nestedValue(values, key) === expected))
+      .sort((left, right) => Object.keys(right.when).length - Object.keys(left.when).length);
+    const missing = node.dependsOn.filter((key) => nestedValue(values, key) === undefined);
+    if (missing.length > 0 && conditional.length > 0) {
+      pending.push({ nodeId: node.id, dependsOn: node.dependsOn, missing });
+      continue;
+    }
+    if (candidates.length === 0) {
+      unknown.push({
+        nodeId: node.id,
+        dependsOn: node.dependsOn,
+        observed: Object.fromEntries(node.dependsOn.map((key) => [key, nestedValue(values, key)])),
+      });
+      continue;
+    }
+    const specificity = Object.keys(candidates[0].when).length;
+    const equallySpecific = candidates.filter((route) => Object.keys(route.when).length === specificity);
+    if (equallySpecific.length > 1) {
+      ambiguous.push({ nodeId: node.id, routes: equallySpecific.map((route) => route.id) });
+      continue;
+    }
+    const route = candidates[0];
+    if (route.status === 'unlearned') {
+      unknown.push({
+        nodeId: node.id,
+        routeId: route.id,
+        routeSignature: route.signature,
+        reason: 'route-unlearned',
+      });
+      continue;
+    }
+    resolved.push({
+      nodeId: node.id,
+      title: node.title,
+      type: node.type,
+      routeId: route.id,
+      routeSignature: route.signature,
+      actions: route.actions,
+      postcondition: route.postcondition,
+      expectation: route.expectation ?? null,
+    });
+  }
+  return {
+    status: ambiguous.length > 0
+      ? 'ambiguous'
+      : unknown.length > 0
+        ? 'needs-learning'
+        : pending.length > 0
+          ? 'needs-facts'
+          : 'ready',
+    resolved,
+    pending,
+    unknown,
+    ambiguous,
+  };
 }

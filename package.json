@@ -7,7 +7,8 @@
   "scripts": {
     "workflow": "node ./src/workflowctl.mjs",
     "cachectl": "node ./src/cachectl.mjs",
-    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs",
+    "recipe": "node ./src/recipe-runner.mjs",
+    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs && node --check ./src/recipe-runner.mjs",
     "test": "node --test",
     "browser": "playwright-cli",
     "browser:help": "playwright-cli --help",

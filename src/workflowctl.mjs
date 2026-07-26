@@ -3,7 +3,7 @@
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import {
   cacheDisplayPaths,
   ensurePromptCache,
@@ -21,9 +21,9 @@ Prompt workflow state CLI
 Commands:
   init --summary <text> [--intent <sanitized-workflow>]
        [--prompt-file <path> | --prompt-key <key>]
-       [--name <name>] [--input key=value]...
+       [--workflow-name <name>] [--input key=value]...
   show --run <run-id>
-  latest [--name <name>] [--input key=value]...
+  latest [--workflow-name <name>] [--input key=value]...
   context --run <run-id>
   plan-add --run <run-id> --id <step-id> --title <text> [--after <step-id>]
   step --run <run-id> --id <step-id> --status <status> [--note <text>]
@@ -34,18 +34,22 @@ Commands:
   resume --run <run-id>
   output --run <run-id> --key <a.b.c> --value <value>
   evidence --run <run-id> --kind <kind> --value <path-or-url> [--note <text>]
+  commit --run <run-id> --file <project-relative-json>
   review --run <run-id>
   confirm --run <run-id> --action <action> --by <name>
   complete --run <run-id>
 
 The user's prompt is the workflow definition. Each execution has immutable inputs and isolated
 state. The Agent maintains the dynamic plan, facts, decisions, and recovery cursor.
+Use commit once per meaningful business boundary to save steps, facts, decisions, outputs,
+evidence, route selection, cursor, and telemetry in one process.
 `);
   process.exit(exitCode);
 }
 
 function args(argv) {
-  const [command, ...rest] = argv;
+  const normalized = argv[0] === '--' ? argv.slice(1) : argv;
+  const [command, ...rest] = normalized;
   const flags = {};
   for (let index = 0; index < rest.length; index += 1) {
     const token = rest[index];
@@ -129,7 +133,21 @@ function normalizeRun(run) {
   run.evidenceSummary ??= {};
   run.evidenceRecent ??= [];
   run.authorizations ??= {};
+  run.recipe ??= {
+    version: null,
+    selections: [],
+  };
+  run.executionHistory ??= [];
   return run;
+}
+
+async function readProjectJson(file) {
+  const absolute = resolve(ROOT, file);
+  const pathFromRoot = relative(ROOT, absolute);
+  if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot)) {
+    throw new Error('--file must be inside the project');
+  }
+  return JSON.parse(await readFile(absolute, 'utf8'));
 }
 
 async function loadRun(runId) {
@@ -269,6 +287,10 @@ ${toMarkdown(run.facts)}
 
 ${decisionsMarkdown(run.decisions)}
 
+## Recipe
+
+${toMarkdown(run.recipe)}
+
 ## Cursor
 
 ${toMarkdown(run.cursor)}
@@ -292,6 +314,10 @@ ${toMarkdown(run.evidenceSummary)}
 ## Recent evidence
 
 ${toMarkdown(run.evidenceRecent)}
+
+## Recent execution telemetry
+
+${toMarkdown(run.executionHistory.slice(-10))}
 `;
 }
 
@@ -300,7 +326,10 @@ async function main() {
   if (!command || command === 'help' || command === '--help') usage();
 
   if (command === 'init') {
-    const name = safeName(one(flags, 'name', false) ?? 'prompt-workflow', 'name');
+    const name = safeName(
+      one(flags, 'workflow-name', false) ?? one(flags, 'name', false) ?? 'prompt-workflow',
+      'name',
+    );
     const summary = one(flags, 'summary');
     const createdAt = new Date().toISOString();
     const runId = `${new Date().toISOString().slice(0, 10).replaceAll('-', '')}-${safePart(name)}-${randomUUID().slice(0, 6)}`;
@@ -341,17 +370,26 @@ async function main() {
       evidenceSummary: {},
       evidenceRecent: [],
       authorizations: {},
+      recipe: {
+        version: null,
+        selections: [],
+      },
+      executionHistory: [],
     };
     await mkdir(runDir(runId), { recursive: true });
     await saveRun(run);
     await writeFile(join(runDir(runId), 'evidence.jsonl'), '', 'utf8');
+    await writeFile(join(runDir(runId), 'events.jsonl'), '', 'utf8');
     console.log(`Created workflow run: ${runId}`);
     console.log(`State: ${join('.workflow-runs', runId, 'state.json')}`);
     return;
   }
 
   if (command === 'latest') {
-    const run = await latestRun(one(flags, 'name', false), parseInputs(flags.input));
+    const run = await latestRun(
+      one(flags, 'workflow-name', false) ?? one(flags, 'name', false),
+      parseInputs(flags.input),
+    );
     console.log(run.runId);
     return;
   }
@@ -513,6 +551,132 @@ async function main() {
     run.evidenceRecent = run.evidenceRecent.slice(-20);
     await saveRun(run);
     console.log('Evidence recorded.');
+    return;
+  }
+
+  if (command === 'commit') {
+    if (run.status === 'completed') throw new Error('Completed runs cannot be changed');
+    if (run.status === 'waiting') throw new Error('Run is waiting; resume it before committing');
+    const payload = await readProjectJson(one(flags, 'file'));
+    const at = new Date().toISOString();
+    const steps = payload.steps ?? (payload.step ? [payload.step] : []);
+    for (const update of steps) {
+      const id = safeName(update.id, 'step id');
+      let step = run.plan.find((item) => item.id === id);
+      if (!step) {
+        if (!update.title) throw new Error(`New step ${id} requires a title`);
+        step = {
+          id,
+          title: update.title,
+          status: 'pending',
+          createdAt: at,
+          updatedAt: at,
+        };
+        run.plan.push(step);
+      }
+      if (update.status) {
+        if (!STEP_STATUSES.has(update.status)) throw new Error(`Invalid step status: ${update.status}`);
+        step.status = update.status;
+      }
+      if (update.title) step.title = update.title;
+      if (update.note) step.note = update.note;
+      step.updatedAt = at;
+    }
+
+    for (const fact of payload.facts ?? []) {
+      if (!fact.key || fact.value === undefined) throw new Error('Each fact requires key and value');
+      setPath(run.facts, fact.key, fact.value);
+      run.factHistory.push({
+        key: fact.key,
+        value: fact.value,
+        source: fact.source ?? '',
+        at,
+      });
+      invalidateAuthorizations(run, `Fact changed: ${fact.key}`);
+    }
+
+    for (const decision of payload.decisions ?? []) {
+      const name = safeName(decision.name, 'decision name');
+      if (decision.selected === undefined || !decision.reason) {
+        throw new Error(`Decision ${name} requires selected and reason`);
+      }
+      run.decisions.push({
+        name,
+        condition: decision.condition ?? '',
+        selected: decision.selected,
+        reason: decision.reason,
+        at,
+      });
+      invalidateAuthorizations(run, `Decision changed: ${name}`);
+    }
+
+    for (const output of payload.outputs ?? []) {
+      if (!output.key || output.value === undefined) throw new Error('Each output requires key and value');
+      setPath(run.data, output.key, output.value);
+      invalidateAuthorizations(run, `Output changed: ${output.key}`);
+    }
+
+    if (payload.cursor) {
+      const stepId = safeName(payload.cursor.step, 'cursor step id');
+      findStep(run, stepId);
+      run.cursor = {
+        currentStep: stepId,
+        nextAction: payload.cursor.next ?? '',
+        system: payload.cursor.system ?? run.cursor.system ?? '',
+        lastUrl: payload.cursor.url ?? run.cursor.lastUrl ?? '',
+        at,
+      };
+    }
+
+    if (payload.recipe) {
+      if (payload.recipe.version !== undefined) run.recipe.version = payload.recipe.version;
+      for (const selection of payload.recipe.selections ?? []) {
+        const nodeId = safeName(selection.nodeId, 'recipe node id');
+        const routeId = safeName(selection.routeId, 'recipe route id');
+        run.recipe.selections = run.recipe.selections.filter((item) => item.nodeId !== nodeId);
+        run.recipe.selections.push({
+          nodeId,
+          routeId,
+          routeSignature: selection.routeSignature ?? 'default',
+          at,
+        });
+      }
+    }
+
+    for (const evidence of payload.evidence ?? []) {
+      if (!evidence.kind || !evidence.value) throw new Error('Each evidence item requires kind and value');
+      const item = await addEvidence(runId, evidence.kind, evidence.value, evidence.note ?? '');
+      run.evidenceCount += 1;
+      run.evidenceSummary[evidence.kind] = (run.evidenceSummary[evidence.kind] ?? 0) + 1;
+      run.evidenceRecent.push(item);
+    }
+    run.evidenceRecent = run.evidenceRecent.slice(-20);
+
+    if (payload.telemetry) {
+      const event = {
+        at,
+        batchId: payload.telemetry.batchId ?? '',
+        nodeId: payload.telemetry.nodeId ?? '',
+        routeId: payload.telemetry.routeId ?? '',
+        startedAt: payload.telemetry.startedAt ?? '',
+        endedAt: payload.telemetry.endedAt ?? at,
+        durationMs: Number(payload.telemetry.durationMs ?? 0),
+        orchestrationGapMs: Number(payload.telemetry.orchestrationGapMs ?? 0),
+        status: payload.telemetry.status ?? 'success',
+      };
+      if (!Number.isFinite(event.durationMs) || event.durationMs < 0) {
+        throw new Error('telemetry.durationMs must be a non-negative number');
+      }
+      if (!Number.isFinite(event.orchestrationGapMs) || event.orchestrationGapMs < 0) {
+        throw new Error('telemetry.orchestrationGapMs must be a non-negative number');
+      }
+      run.executionHistory.push(event);
+      run.executionHistory = run.executionHistory.slice(-100);
+      await appendFile(join(runDir(runId), 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8');
+    }
+
+    await saveRun(run);
+    console.log(`Workflow boundary committed: ${steps.map((step) => step.id).join(', ') || 'state-only'}`);
     return;
   }
 

@@ -8,6 +8,7 @@ import test from 'node:test';
 const root = resolve(import.meta.dirname, '..');
 const workflowctl = join(root, 'src', 'workflowctl.mjs');
 const cachectl = join(root, 'src', 'cachectl.mjs');
+const recipeRunner = join(root, 'src', 'recipe-runner.mjs');
 
 function run(...args) {
   return execFileSync(process.execPath, [workflowctl, ...args], {
@@ -19,6 +20,14 @@ function run(...args) {
 
 function cache(...args) {
   return execFileSync(process.execPath, [cachectl, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function recipe(...args) {
+  return execFileSync(process.execPath, [recipeRunner, ...args], {
     cwd: root,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -280,6 +289,153 @@ test('definition and page caches are isolated by prompt identity and content ver
   assert.notEqual(updatedA.prompt.scope, preparedA.prompt.scope);
 });
 
+test('parameterized recipes isolate type A and B routes and stop on an unknown type', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `recipe-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/recipe-${suffix}.prompt.md`;
+  const commitPath = join(root, `.recipe-commit-${suffix}.json`);
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Process an order according to its observed type.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(commitPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+
+  cache(
+    'recipe-node', '--prompt-key', prepared.prompt.key,
+    '--id', 'process-order', '--title', 'Process order by type',
+    '--depends-on', 'order.type',
+  );
+  cache(
+    'page-init', '--prompt-key', prepared.prompt.key,
+    '--page', 'order-details', '--origin', 'https://orders.example',
+    '--route', '/orders/*', '--title', 'Order details', '--anchor', 'Order type',
+  );
+  cache(
+    'page-init', '--prompt-key', prepared.prompt.key,
+    '--page', 'order-details', '--variant', 'specialist',
+    '--context', 'role=specialist', '--origin', 'https://orders.example',
+    '--route', '/orders/*', '--title', 'Order details', '--anchor', 'Risk level',
+  );
+  const actionAOutput = cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'order-details', '--name', 'normal-approval',
+    '--strategy', 'locator', '--locator-kind', 'role', '--role', 'button',
+    '--target', 'Normal approval', '--operation', 'click',
+    '--postcondition', 'Normal approval panel is visible',
+  );
+  const actionBOutput = cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'order-details', '--variant', 'specialist', '--name', 'special-approval',
+    '--strategy', 'locator', '--locator-kind', 'role', '--role', 'button',
+    '--target', 'Special approval', '--operation', 'click',
+    '--postcondition', 'Special approval panel is visible',
+  );
+  assert.match(actionAOutput, /candidate-/);
+  assert.match(actionBOutput, /candidate-/);
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'process-order', '--id', 'type-a', '--when', 'order.type=A',
+    '--action', 'order-details/normal-approval',
+    '--expect-action', 'order-details/normal-approval',
+    '--postcondition', 'Normal approval is available',
+  );
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'process-order', '--id', 'type-b', '--when', 'order.type=B',
+    '--action', 'order-details@specialist/special-approval',
+    '--expect-action', 'order-details@specialist/special-approval',
+    '--postcondition', 'Special approval is available',
+  );
+
+  const typeA = JSON.parse(cache(
+    'recipe-resolve', '--prompt-key', prepared.prompt.key, '--value', 'order.type=A',
+  ));
+  const typeB = JSON.parse(cache(
+    'recipe-resolve', '--prompt-key', prepared.prompt.key, '--value', 'order.type=B',
+  ));
+  const typeC = JSON.parse(cache(
+    'recipe-resolve', '--prompt-key', prepared.prompt.key, '--value', 'order.type=C',
+  ));
+  const missingType = JSON.parse(cache('recipe-resolve', '--prompt-key', prepared.prompt.key));
+  assert.equal(typeA.status, 'ready');
+  assert.equal(typeA.resolved[0].routeId, 'type-a');
+  assert.equal(typeB.resolved[0].routeId, 'type-b');
+  assert.equal(typeB.resolved[0].actions[0].variant, 'specialist');
+  assert.equal(typeC.status, 'needs-learning');
+  assert.equal(typeC.unknown[0].observed['order.type'], 'C');
+  assert.equal(missingType.status, 'needs-facts');
+
+  id = runId(run(
+    'init', '--summary', 'Process order B', '--name', 'order-processing',
+    '--prompt-key', prepared.prompt.key, '--input', 'order.id=B-100',
+  ));
+  await writeFile(commitPath, JSON.stringify({
+    step: {
+      id: 'process-order',
+      title: 'Process order by type',
+      status: 'in_progress',
+      note: 'Type B route selected',
+    },
+    facts: [{ key: 'order.type', value: 'B', source: 'Order details page' }],
+    decisions: [{
+      name: 'order-route',
+      selected: 'type-b',
+      reason: 'Observed order.type B',
+    }],
+    outputs: [{ key: 'result.route', value: 'special-approval' }],
+    cursor: {
+      step: 'process-order',
+      next: 'Execute the cached Type B route',
+      system: 'orders',
+      url: 'https://orders.example/orders/B-100',
+    },
+    recipe: {
+      version: typeB.recipeVersion,
+      selections: [{
+        nodeId: 'process-order',
+        routeId: 'type-b',
+        routeSignature: 'order.type=B',
+      }],
+    },
+    telemetry: {
+      batchId: 'resolve-type-b',
+      nodeId: 'process-order',
+      routeId: 'type-b',
+      durationMs: 12,
+      orchestrationGapMs: 0,
+      status: 'success',
+    },
+  }, null, 2), 'utf8');
+  run('commit', '--run', id, '--file', `.recipe-commit-${suffix}.json`);
+
+  const state = JSON.parse(run('show', '--run', id));
+  assert.equal(state.facts.order.type, 'B');
+  assert.equal(state.data.result.route, 'special-approval');
+  assert.equal(state.recipe.selections[0].routeId, 'type-b');
+  assert.equal(state.executionHistory[0].durationMs, 12);
+
+  const dryRun = JSON.parse(recipe(
+    '--run', id, '--node', 'process-order', '--dry-run', 'true',
+  ));
+  assert.equal(dryRun.routeId, 'type-b');
+  assert.equal(dryRun.actionCount, 1);
+  assert.equal(dryRun.actions[0].variant, 'specialist');
+  assert.deepEqual(dryRun.actions[0].selector, {
+    kind: 'role',
+    value: 'Special approval',
+    role: 'button',
+  });
+});
+
 test('official Playwright Skill and prompt-first project guidance are present', () => {
   const officialSkill = join(root, '.agents', 'skills', 'playwright-cli', 'SKILL.md');
   const guidance = readFileSync(join(root, 'AGENTS.md'), 'utf8');
@@ -287,7 +443,9 @@ test('official Playwright Skill and prompt-first project guidance are present', 
   assert.match(guidance, /The prompt is the workflow definition/);
   assert.match(guidance, /Do not require the user to create a Skill, YAML contract/);
   assert.match(guidance, /Prompt file identity plus its content hash/);
-  assert.match(guidance, /Do not run a full snapshot on every successful cached action/);
+  assert.match(guidance, /parameterized Workflow Recipe/);
+  assert.match(guidance, /workflow commit/);
+  assert.match(guidance, /Do not pre-check and post-check every cached click or fill/);
   assert.equal(existsSync(join(root, 'workflows')), false);
   assert.equal(existsSync(join(root, 'skills')), false);
   assert.equal(existsSync(join(root, 'knowledge')), false);

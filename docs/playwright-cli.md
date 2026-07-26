@@ -37,19 +37,37 @@ pnpm browser select <ref> "<option>"
 pnpm browser snapshot
 ```
 
-Refs are valid only for the current page state. After a stable action succeeds, cache a user-facing locator, scoped CSS fallback, page fingerprint, and postcondition through `pnpm cachectl`; do not cache the ref.
+Refs are valid only for the current page state. After a stable action succeeds, cache a user-facing locator, scoped CSS fallback, page fingerprint, and postcondition through `pnpm run cachectl --`; do not cache the ref.
 
 ## Cached fast path
 
 For later runs of the unchanged Prompt:
 
-1. Load its page cache.
-2. Verify the URL, title, and cached anchors.
-3. Execute a healthy cached locator with `--raw`.
-4. Verify the cached postcondition.
-5. Record success or failure in the cache.
+1. Resolve the current business node against the parameterized recipe.
+2. Select the matching guarded route and named page variant.
+3. Execute the route with `pnpm run recipe -- --run <run-id> --node <node-id>`.
+4. Let the runner verify page fingerprints, perform all safe actions, extract facts, and validate
+   the business-boundary expectation inside one official Playwright CLI `run-code` call.
+5. Commit the generated boundary payload once with `pnpm run workflow -- commit`.
 
-Successful cached actions do not need a full snapshot. If an action fails, take a screenshot first, then use a depth-limited or element-scoped snapshot only when visual information is insufficient. Learn the replacement locator and update the same Prompt cache.
+Successful cached actions do not return to the Agent individually and do not need a full snapshot.
+If a batch fails, take a screenshot first, then use a depth-limited or element-scoped snapshot only
+when visual information is insufficient. Repair only the failed locator, page variant, guarded
+route, or recipe node according to the actual scope of the change.
+
+Use structured locator candidates for batchable actions:
+
+```bash
+pnpm run cachectl -- action-learn --prompt-key <prompt-key> \
+  --page order-details --name submit-filter \
+  --strategy locator --locator-kind role --role button \
+  --target "筛选" --operation click \
+  --postcondition "筛选结果可见"
+```
+
+Legacy free-form Playwright locator candidates remain readable, but the batch runner intentionally
+does not evaluate them as JavaScript. Re-learn them with `--locator-kind`, or use a CSS candidate,
+before enabling the fast path.
 
 Useful read-only or diagnostic commands:
 

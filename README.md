@@ -35,7 +35,7 @@ pnpm browser install --skills agents
 提交审批前展示汇总并等待我确认。
 ```
 
-Agent 会自行把 Prompt 转成动态执行步骤、读取当前页面、判断条件分支并选择合适命令。流程变化时直接修改 Prompt，不需要同步修改代码。
+Agent 会在首次运行时把 Prompt 学习成参数化流程图；后续把本次变量注入流程，根据已知条件选择缓存分支，并以业务步骤为单位批量操作页面。流程变化时直接修改 Prompt，不需要同步修改业务代码。
 
 ## 目录职责
 
@@ -57,88 +57,108 @@ docs/                           安装与排障说明
 
 ```bash
 # 保存一个可恢复的运行记录
-pnpm workflow init \
+pnpm run workflow -- init \
   --summary "处理订单 A" \
   --intent "读取订单类型；实物订单走仓储流程，虚拟订单走许可证流程；更新订单前等待确认" \
   --prompt-key <prompt-key> \
-  --name order-processing \
+  --workflow-name order-processing \
   --input order.id=A
 
-# Agent 从 Prompt 生成初始计划
-pnpm workflow plan-add --run <run-id> \
-  --id inspect-order --title "读取订单类型"
-
-# 页面显示订单 A 是实物订单
-pnpm workflow fact --run <run-id> \
-  --key order.type --value physical --source "订单详情页"
-pnpm workflow decision --run <run-id> \
-  --name order-route --selected warehouse \
-  --condition "order.type is physical" \
-  --reason "订单详情页显示为实物订单"
-
-# Agent 动态加入当前分支的步骤并保存恢复位置
-pnpm workflow plan-add --run <run-id> \
-  --id check-inventory --title "检查库存" --after inspect-order
-pnpm workflow checkpoint --run <run-id> \
-  --step check-inventory \
-  --next "在仓储系统查询订单 A 的库存" \
-  --system warehouse \
-  --url "https://warehouse.example/..."
+# Agent 在一个业务边界完成后，一次性提交步骤、facts、decision、
+# outputs、断点、缓存路由和耗时；用户不需要手工编写这个 JSON。
+pnpm run workflow -- commit --run <run-id> \
+  --file .workflow-runs/<run-id>/last-boundary.json
 
 # 使用同一个 run id 操作可见浏览器
 pnpm browser -s=<run-id> open <url> --headed
 
 # 新会话根据业务变量精确找回未完成的 run
-pnpm workflow latest --name order-processing --input order.id=A
-pnpm workflow context --run <run-id>
+pnpm run workflow -- latest --workflow-name order-processing --input order.id=A
+pnpm run workflow -- context --run <run-id>
 ```
 
 `context` 会为新的 Copilot 会话输出恢复所需的目标、输入、计划、事实、分支决策、当前步骤、下一动作、等待状态、结果和确认记录。新的 Agent 随后重新观察浏览器页面并继续；不会复用已经失效的 element ref。
 
 同一套流程处理订单 A 和订单 B 时，Agent 会创建两个相互隔离的 run。Prompt 中随每次执行变化的订单号、服务、分支、环境等保存为该 run 的输入；运行过程中从 Web 系统取得的编号、版本和报告结果保存为该 run 的数据，不会从其他 run 继承。
 
-状态采用类似 n8n Execution 的思想，但没有固定节点图：Prompt 是流程定义，Agent 动态维护 `plan`；页面发现的业务属性进入 `facts`；条件分支进入 `decisions`；跨系统结果进入 `outputs`；`cursor` 保存断点。
+状态采用类似 n8n Execution 的思想：Prompt 是用户维护的源定义；首次运行后生成参数化 Workflow Recipe；页面发现的业务属性进入 `facts`；选中的缓存路线进入 `recipe.selections`；跨系统结果进入 `outputs`；`cursor` 保存断点。
 
-运行记录位于 `.workflow-runs/`，默认不会提交到 Git。密码、验证码和人工步骤如何处理，由对应业务 Prompt 决定；项目不提供统一业务策略或浏览器命令包装脚本。
+运行记录位于 `.workflow-runs/`，默认不会提交到 Git。密码、验证码和人工步骤如何处理，由对应业务 Prompt 决定；项目不提供业务专属脚本，通用 Recipe Runner 只负责执行已学习并通过边界校验的页面动作。
 
 ## Prompt 专属缓存
 
-每个 Prompt 文件根据“文件身份 + 内容哈希”获得独立缓存：
+每个 Prompt 文件根据“文件身份 + 内容哈希”获得独立缓存。逻辑上分成两层：
 
 ```text
 .workflow-cache/
 ├── definitions/
 │   └── <prompt-key>/
-│       └── <prompt-hash>.json
+│       └── <prompt-hash>.json        参数化流程节点与条件路线
 └── pages/
     └── <prompt-key>/
         └── <prompt-hash>/
-            └── <page-id>.json
+            └── <page-id>.json        页面变体、语义动作与 locator 候选
 ```
 
 - 同一个 Prompt、不同订单或资源变量：共享缓存，run 相互隔离；
 - 不同 Prompt：缓存完全隔离；
 - Prompt 内容改变：自动创建新版本，不复用旧版本；
-- 缓存由 Agent 自动生成，用户只维护自然语言 Prompt；
+- 订单号、资源名称等实例变量只进入 run，不作为缓存分支；
+- 订单类型、环境等真正改变步骤的变量用于选择局部路线；
+- 角色、租户、语言和 UI 版本用于选择页面变体；
+- 缓存由 Agent 自动生成和修复，用户只维护自然语言 Prompt；
 - snapshot ref、凭据、验证码和本次业务变量不会写入缓存。
 
-首次执行时，Agent 解析 Prompt、探索页面并学习稳定操作：
+首次执行时，Agent 解析 Prompt、探索页面，并学习业务节点、局部路线和稳定操作：
 
 ```bash
-pnpm cachectl list
-pnpm cachectl prepare --prompt-key <prompt-key>
-pnpm cachectl definition-step --prompt-key <prompt-key> \
-  --id inspect-order --title "读取订单类型"
-pnpm cachectl page-init --prompt-key <prompt-key> \
+pnpm run cachectl -- list
+pnpm run cachectl -- prepare --prompt-key <prompt-key>
+pnpm run cachectl -- recipe-node --prompt-key <prompt-key> \
+  --id process-order --title "按订单类型处理" \
+  --depends-on order.type
+
+pnpm run cachectl -- page-init --prompt-key <prompt-key> \
   --page order-details --origin "https://orders.example" \
   --route "/orders/*" --title "订单详情" --anchor "订单类型"
-pnpm cachectl action-learn --prompt-key <prompt-key> \
-  --page order-details --name open-order \
-  --strategy locator --target "getByRole('link', { name: '订单详情' })" \
-  --postcondition "订单详情标题可见"
+
+pnpm run cachectl -- action-learn --prompt-key <prompt-key> \
+  --page order-details --name normal-approval \
+  --strategy locator --locator-kind role --role button \
+  --target "普通审批" --operation click \
+  --postcondition "普通审批面板可见"
+
+pnpm run cachectl -- recipe-route --prompt-key <prompt-key> \
+  --node process-order --id type-a --when order.type=A \
+  --action order-details/normal-approval \
+  --expect-text "普通审批"
 ```
 
-后续执行先验证页面指纹，再通过 `--raw` 使用缓存 locator，并验证后置条件。缓存失败时，Agent 先截图，再按需读取局部 snapshot，学习新的 locator 并回写缓存；成功路径不再反复读取完整页面结构。
+同一节点可以拥有 Type A、Type B 等多条路线。`order.id` 不参与路线选择，`order.type` 才参与：
+
+```bash
+pnpm run cachectl -- recipe-resolve --prompt-key <prompt-key> \
+  --value order.type=A
+```
+
+结果状态可能是：
+
+- `ready`：直接执行选中的缓存路线；
+- `needs-facts`：只读取缺少的路由事实；
+- `needs-learning`：首次遇到新类型，只探索这个节点；
+- `ambiguous`：路线规则冲突，需要 Agent 修复定义。
+
+缓存命中后，一个业务节点由一条命令完成：
+
+```bash
+pnpm run recipe -- --run <run-id> --node process-order
+pnpm run workflow -- commit --run <run-id> \
+  --file .workflow-runs/<run-id>/last-boundary.json
+```
+
+`pnpm run recipe --` 会把该节点的多个安全动作编译进官方 Playwright CLI 的一次 `run-code` 调用，在进程内完成页面变体校验、操作、提取和业务边界验证，并自动记录每个动作耗时。成功路径不再把每次点击、find、eval 和 cache 写入分别交回 Agent。
+
+当批次与预期不一致时才返回 Agent：临时加载问题只重试；locator 变化只修复页面动作；角色、租户或 UI 版本不同则学习新的页面变体；新订单类型学习新的 guarded route；业务顺序改变才升级对应 recipe 节点。
 
 使用 `prompt-key` 是为了避免 Windows shell 对包含中文、空格的 Prompt 路径进行错误拆分。Prompt 文件名和正文不需要因此修改。
 
