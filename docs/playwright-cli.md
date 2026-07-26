@@ -55,6 +55,11 @@ If a batch fails, take a screenshot first, then use a depth-limited or element-s
 when visual information is insufficient. Repair only the failed locator, page variant, guarded
 route, or recipe node according to the actual scope of the change.
 
+The runner groups consecutive actions by page variant. It waits for the next fingerprint after an
+SPA transition and, on retry, resumes from the currently matching group instead of requiring the
+browser to return to the route's first page. Use `--transition-timeout-ms` on `recipe-route` only
+when a system has a known transition time longer than the default 10 seconds.
+
 Use structured locator candidates for batchable actions:
 
 ```bash

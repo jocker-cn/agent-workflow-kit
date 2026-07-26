@@ -172,13 +172,14 @@ function operationCode(action, locator, values) {
   throw new Error(`Unsupported operation: ${action.operation}`);
 }
 
-function fingerprintCode(fingerprint) {
-  return `await __verifyPage(${JSON.stringify({
+function fingerprintValue(pageId, variantId, fingerprint) {
+  return {
+    id: `${pageId}@${variantId}`,
     origin: fingerprint.origin ?? '',
     route: fingerprint.route ?? '',
     title: fingerprint.title ?? '',
     anchors: fingerprint.anchors ?? [],
-  })})`;
+  };
 }
 
 function expectationCode(expectation, actionLookup) {
@@ -261,48 +262,86 @@ async function main() {
     actionLookup.set(`${reference.page}@${variantId}/${reference.action}`, selected);
   }
 
+  const actionGroups = [];
+  for (const selected of selectedActions) {
+    const variantId = selected.reference.variant ?? 'default';
+    const key = `${selected.reference.page}@${variantId}`;
+    let group = actionGroups.at(-1);
+    if (!group || group.key !== key) {
+      group = {
+        key,
+        fingerprint: fingerprintValue(selected.reference.page, variantId, selected.variant.fingerprint),
+        actions: [],
+      };
+      actionGroups.push(group);
+    }
+    group.actions.push(selected);
+  }
+
   const lines = [
     'async page => {',
     '  const __results = [];',
     '  const __extracted = {};',
-    '  const __verifyPage = async expected => {',
+    `  const __groups = ${JSON.stringify(actionGroups.map((group) => group.fingerprint))};`,
+    `  const __transitionTimeoutMs = ${selectedRoute.transitionTimeoutMs};`,
+    '  const __matchesPage = async expected => {',
     '    const currentUrl = page.url();',
-    '    if (expected.origin && currentUrl !== expected.origin && !currentUrl.startsWith(`${expected.origin}/`)) throw new Error(`origin:${currentUrl}`);',
+    '    if (expected.origin && currentUrl !== expected.origin && !currentUrl.startsWith(`${expected.origin}/`)) return false;',
     '    if (expected.route) {',
     '      const pattern = new RegExp(`^${expected.route.split("*").map(part => part.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")).join(".*")}$`);',
     '      const routeTarget = expected.route.includes("://") ? currentUrl : currentUrl.slice(expected.origin.length);',
-    '      if (!pattern.test(routeTarget)) throw new Error(`route:${routeTarget}`);',
+    '      if (!pattern.test(routeTarget)) return false;',
     '    }',
-    '    if (expected.title && !(await page.title()).includes(expected.title)) throw new Error(`title:${await page.title()}`);',
+    '    if (expected.title && !(await page.title()).includes(expected.title)) return false;',
     '    for (const anchor of expected.anchors) {',
-    '      if (await page.getByText(anchor, { exact: false }).count() === 0) throw new Error(`anchor:${anchor}`);',
+    '      if (await page.getByText(anchor, { exact: false }).count() === 0) return false;',
     '    }',
+    '    return true;',
+    '  };',
+    '  const __waitForPage = async (expected, timeoutMs) => {',
+    '    const deadline = Date.now() + timeoutMs;',
+    '    do {',
+    '      if (await __matchesPage(expected)) return;',
+    '      await page.waitForTimeout(100);',
+    '    } while (Date.now() <= deadline);',
+    '    throw new Error(`page-fingerprint:${expected.id}:actual=${page.url()}`);',
+    '  };',
+    '  const __findCurrentGroup = async timeoutMs => {',
+    '    const deadline = Date.now() + timeoutMs;',
+    '    do {',
+    '      for (let index = 0; index < __groups.length; index += 1) {',
+    '        if (await __matchesPage(__groups[index])) return index;',
+    '      }',
+    '      await page.waitForTimeout(100);',
+    '    } while (Date.now() <= deadline);',
+    '    throw new Error(`route-entry:${__groups.map(group => group.id).join("|")}:actual=${page.url()}`);',
     '  };',
     '  try {',
+    '    const __startGroup = await __findCurrentGroup(__transitionTimeoutMs);',
   ];
-  let previousPageVariant = '';
-  for (const selected of selectedActions) {
-    const pageVariant = `${selected.reference.page}@${selected.reference.variant ?? 'default'}`;
-    if (pageVariant !== previousPageVariant) {
-      lines.push(`    ${fingerprintCode(selected.variant.fingerprint)};`);
-      previousPageVariant = pageVariant;
+  for (let groupIndex = 0; groupIndex < actionGroups.length; groupIndex += 1) {
+    const group = actionGroups[groupIndex];
+    lines.push(`    if (__startGroup <= ${groupIndex}) {`);
+    lines.push(`      await __waitForPage(__groups[${groupIndex}], __transitionTimeoutMs);`);
+    for (const selected of group.actions) {
+      const locator = selectorCode(selected.candidate.selector);
+      lines.push('      {');
+      lines.push('        const __startedAt = new Date().toISOString();');
+      lines.push('        const __started = Date.now();');
+      lines.push('        try {');
+      lines.push(`          ${operationCode(selected.action, locator, values)};`);
+      lines.push(`          __results.push({ page: ${JSON.stringify(selected.reference.page)}, variant: ${JSON.stringify(selected.reference.variant ?? 'default')}, name: ${JSON.stringify(selected.reference.action)}, candidate: ${JSON.stringify(selected.candidate.id)}, status: 'success', startedAt: __startedAt, endedAt: new Date().toISOString(), durationMs: Date.now() - __started, cacheHit: true });`);
+      lines.push('        } catch (error) {');
+      lines.push(`          __results.push({ page: ${JSON.stringify(selected.reference.page)}, variant: ${JSON.stringify(selected.reference.variant ?? 'default')}, name: ${JSON.stringify(selected.reference.action)}, candidate: ${JSON.stringify(selected.candidate.id)}, status: 'failure', startedAt: __startedAt, endedAt: new Date().toISOString(), durationMs: Date.now() - __started, cacheHit: true, reason: error.message });`);
+      lines.push('          throw error;');
+      lines.push('        }');
+      lines.push('      }');
     }
-    const locator = selectorCode(selected.candidate.selector);
-    lines.push('    {');
-    lines.push('      const __startedAt = new Date().toISOString();');
-    lines.push('      const __started = Date.now();');
-    lines.push('      try {');
-    lines.push(`        ${operationCode(selected.action, locator, values)};`);
-    lines.push(`        __results.push({ page: ${JSON.stringify(selected.reference.page)}, variant: ${JSON.stringify(selected.reference.variant ?? 'default')}, name: ${JSON.stringify(selected.reference.action)}, candidate: ${JSON.stringify(selected.candidate.id)}, status: 'success', startedAt: __startedAt, endedAt: new Date().toISOString(), durationMs: Date.now() - __started, cacheHit: true });`);
-    lines.push('      } catch (error) {');
-    lines.push(`        __results.push({ page: ${JSON.stringify(selected.reference.page)}, variant: ${JSON.stringify(selected.reference.variant ?? 'default')}, name: ${JSON.stringify(selected.reference.action)}, candidate: ${JSON.stringify(selected.candidate.id)}, status: 'failure', startedAt: __startedAt, endedAt: new Date().toISOString(), durationMs: Date.now() - __started, cacheHit: true, reason: error.message });`);
-    lines.push('        throw error;');
-    lines.push('      }');
     lines.push('    }');
   }
   lines.push('    const __postStarted = Date.now();');
   lines.push(`    ${expectationCode(selectedRoute.expectation, actionLookup)};`);
-  lines.push("    return JSON.stringify({ status: 'success', results: __results, extracted: __extracted, postconditionDurationMs: Date.now() - __postStarted, url: page.url() });");
+  lines.push("    return JSON.stringify({ status: 'success', results: __results, extracted: __extracted, startGroup: __startGroup, skippedGroupCount: __startGroup, postconditionDurationMs: Date.now() - __postStarted, url: page.url() });");
   lines.push('  } catch (error) {');
   lines.push("    return JSON.stringify({ status: 'failure', results: __results, extracted: __extracted, reason: error.message, url: page.url() });");
   lines.push('  }');
@@ -321,6 +360,12 @@ async function main() {
       nodeId,
       routeId: selectedRoute.routeId,
       routeSignature: selectedRoute.routeSignature,
+      transitionTimeoutMs: selectedRoute.transitionTimeoutMs,
+      pageGroups: actionGroups.map((group) => ({
+        pageVariant: group.key,
+        actionCount: group.actions.length,
+        fingerprint: group.fingerprint,
+      })),
       actionCount: selectedActions.length,
       actions: selectedActions.map(({ reference, action, candidate }) => ({
         ...reference,

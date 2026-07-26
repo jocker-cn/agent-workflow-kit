@@ -192,6 +192,7 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
       actions: route.actions,
       postcondition: route.postcondition,
       expectation: route.expectation ?? null,
+      transitionTimeoutMs: route.transitionTimeoutMs ?? 10000,
     });
   }
   return {

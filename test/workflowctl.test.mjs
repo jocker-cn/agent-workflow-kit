@@ -353,6 +353,7 @@ test('parameterized recipes isolate type A and B routes and stop on an unknown t
     '--node', 'process-order', '--id', 'type-b', '--when', 'order.type=B',
     '--action', 'order-details@specialist/special-approval',
     '--expect-action', 'order-details@specialist/special-approval',
+    '--transition-timeout-ms', '15000',
     '--postcondition', 'Special approval is available',
   );
 
@@ -427,6 +428,9 @@ test('parameterized recipes isolate type A and B routes and stop on an unknown t
     '--run', id, '--node', 'process-order', '--dry-run', 'true',
   ));
   assert.equal(dryRun.routeId, 'type-b');
+  assert.equal(dryRun.transitionTimeoutMs, 15000);
+  assert.equal(dryRun.pageGroups.length, 1);
+  assert.equal(dryRun.pageGroups[0].pageVariant, 'order-details@specialist');
   assert.equal(dryRun.actionCount, 1);
   assert.equal(dryRun.actions[0].variant, 'specialist');
   assert.deepEqual(dryRun.actions[0].selector, {

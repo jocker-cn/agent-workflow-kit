@@ -158,6 +158,8 @@ pnpm run workflow -- commit --run <run-id> \
 
 `pnpm run recipe --` 会把该节点的多个安全动作编译进官方 Playwright CLI 的一次 `run-code` 调用，在进程内完成页面变体校验、操作、提取和业务边界验证，并自动记录每个动作耗时。成功路径不再把每次点击、find、eval 和 cache 写入分别交回 Agent。
 
+Recipe 中跨页面的动作会按连续 Page Variant 分组。对于 SPA 跳转，Runner 会等待下一组页面的 URL、标题和锚点稳定后再继续；重试时如果浏览器已经位于后面的页面组，会从当前匹配组恢复，不会再次要求回到 Recipe 的起始页面。
+
 当批次与预期不一致时才返回 Agent：临时加载问题只重试；locator 变化只修复页面动作；角色、租户或 UI 版本不同则学习新的页面变体；新订单类型学习新的 guarded route；业务顺序改变才升级对应 recipe 节点。
 
 使用 `prompt-key` 是为了避免 Windows shell 对包含中文、空格的 Prompt 路径进行错误拆分。Prompt 文件名和正文不需要因此修改。

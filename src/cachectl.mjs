@@ -40,6 +40,7 @@ Commands:
                [--when key=value]... [--action <page-id>[@variant]/<action-name>]...
                [--postcondition <text>]
                [--expect-text <text> | --expect-url <glob> | --expect-action <action-ref>]
+               [--transition-timeout-ms <milliseconds>]
                [--status <learned|unlearned|disabled>]
   recipe-resolve [prompt selection] [--value key=value]...
   definition-step [prompt selection] --id <step-id> --title <text> [--after <step-id>]
@@ -306,6 +307,10 @@ async function main() {
       throw new Error('A learned browser route requires at least one --action');
     }
     const now = new Date().toISOString();
+    const transitionTimeoutMs = Number(one(flags, 'transition-timeout-ms', false) ?? 10000);
+    if (!Number.isFinite(transitionTimeoutMs) || transitionTimeoutMs < 0) {
+      throw new Error('--transition-timeout-ms must be a non-negative number');
+    }
     const existing = node.routes.find((route) => route.id === id);
     const route = {
       id,
@@ -321,6 +326,7 @@ async function main() {
           : one(flags, 'expect-action', false)
             ? { kind: 'action', ...parseActionRef(one(flags, 'expect-action', false)) }
             : null,
+      transitionTimeoutMs,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
