@@ -1,0 +1,24 @@
+id: bilibili-video-metrics
+initialPhase: INIT
+phases:
+  - INIT
+  - LOGIN
+  - WAIT_FOR_USER_VERIFICATION
+  - SEARCH
+  - OPEN_VIDEO
+  - COLLECT_METRICS
+  - REVIEW
+  - DONE
+checks:
+  REVIEW:
+    requiredData:
+      - search.hotSearchTerm
+      - video.url
+      - metrics.likes
+      - metrics.coins
+      - metrics.favorites
+      - metrics.shares
+      - metrics.comments
+    requiredEvidenceKinds:
+      - hot-search
+      - video

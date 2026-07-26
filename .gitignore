@@ -1,0 +1,8 @@
+.workflow-runs/
+.playwright-cli/
+playwright-cli/
+.playwright/
+.idea/
+playwright/.auth/
+*.trace.zip
+*.webm

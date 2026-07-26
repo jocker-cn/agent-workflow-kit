@@ -1,0 +1,42 @@
+id: change-request
+initialPhase: INIT
+phases:
+  - INIT
+  - BUILD
+  - COLLECT_ARTIFACTS
+  - CREATE_CR_DRAFT
+  - FILL_CR
+  - CREATE_PIPELINE
+  - REVIEW
+  - WAIT_FOR_CONFIRMATION
+  - SUBMIT
+  - DONE
+checks:
+  REVIEW:
+    requiredData:
+      - build.number
+      - build.url
+      - build.image
+      - reports.sonar.status
+      - reports.foss.status
+      - cr.id
+      - cr.url
+      - pipeline.status
+    requiredEvidenceKinds:
+      - build
+      - sonar
+      - foss
+      - cr
+      - pipeline
+gates:
+  submit:
+    authorizationPhase: WAIT_FOR_CONFIRMATION
+    targetPhase: SUBMIT
+    requiredData:
+      - build.image
+      - cr.id
+      - pipeline.status
+    requiredEvidenceKinds:
+      - build
+      - cr
+      - pipeline
