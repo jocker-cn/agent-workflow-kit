@@ -84,6 +84,10 @@ This JSON is generated and maintained by the Agent. It is not user configuration
       ],
       "barrier": "none",
       "risk": "read",
+      "authorization": {
+        "mode": "not-required",
+        "scope": "Search and read one resource"
+      },
       "operations": [
         {
           "id": "apply-filter",
@@ -98,6 +102,41 @@ This JSON is generated and maintained by the Agent. It is not user configuration
       ]
     }
   ]
+}
+```
+
+An explicitly requested bounded write is prompt-authorized even when its generated values are not
+known before execution:
+
+```json
+{
+  "id": "submit-resources",
+  "title": "Create the requested resources",
+  "type": "browser",
+  "risk": "irreversible",
+  "barrier": "none",
+  "authorization": {
+    "mode": "prompt",
+    "scope": "Create resources in the Prompt target system",
+    "countFrom": "num",
+    "maxCount": 20,
+    "constraints": [
+      "Generate fields only from the ranges declared in the Prompt"
+    ]
+  }
+}
+```
+
+Use runtime confirmation only when the Prompt requests it or additional authority is needed:
+
+```json
+{
+  "risk": "irreversible",
+  "barrier": "risk",
+  "authorization": {
+    "mode": "runtime",
+    "scope": "Publish the final reviewed production release"
+  }
 }
 ```
 
@@ -146,7 +185,12 @@ model:
 - Use `affinity.state` for materially different states on the same URL.
 - Use `barrier`: `none`, `human`, `decision`, `risk`, or `context`.
 - Use `risk`: `read`, `reversible`, or `irreversible`.
-- Mark an irreversible transaction with a `risk` or `human` barrier.
+- Use `authorization.mode`: `not-required`, `prompt`, or `runtime`.
+- `prompt` means the current Prompt explicitly authorizes the action within `scope`, `count` or
+  `countFrom`, `maxCount`, and `constraints`. It does not pause.
+- `runtime` requires a `risk` or `human` barrier and a valid confirmation recorded for the node.
+- An irreversible transaction must explicitly use `prompt` or `runtime`; irreversibility alone
+  does not create a barrier.
 - Describe semantic operations here. Stable Playwright locators remain in the page cache.
 - After a same-URL search/filter mutation, learn a structured cache action with
   `--operation wait --wait-for stable`, usually scoped with `--has-text-from <input-or-fact>`.

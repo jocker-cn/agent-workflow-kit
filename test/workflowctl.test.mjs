@@ -921,6 +921,10 @@ test('risk boundaries remain waiting until the exact node is confirmed', async (
       type: 'report',
       barrier: 'risk',
       risk: 'irreversible',
+      authorization: {
+        mode: 'runtime',
+        scope: 'Publish the reviewed result',
+      },
       routes: [{
         id: 'default',
         when: {},
@@ -944,6 +948,78 @@ test('risk boundaries remain waiting until the exact node is confirmed', async (
   assert.equal(completed.status, 'workflow-segment-complete');
   assert.equal(completed.executed[0].nodeId, 'publish-result');
   assert.equal(JSON.parse(run('show', '--run', id)).plan[0].status, 'completed');
+});
+
+test('a bounded write explicitly authorized by the Prompt does not pause for confirmation', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `prompt-authorized-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-prompt-authorized-${suffix}.json`);
+  const relativePrompt = `.github/prompts/prompt-authorized-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-prompt-authorized-${suffix}.json`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Generate and submit num resources without per-item confirmation.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: { name: 'prompt-authorized-write' },
+    inputs: [{ key: 'num', required: true, structural: false }],
+    transactions: [{
+      id: 'submit-resources',
+      title: 'Submit requested resources',
+      description: 'Submit the bounded number of generated resources requested by the Prompt',
+      type: 'report',
+      risk: 'irreversible',
+      barrier: 'none',
+      authorization: {
+        mode: 'prompt',
+        scope: 'Create resources in the requested target',
+        countFrom: 'num',
+        maxCount: 10,
+        constraints: ['Use only Prompt-declared random value ranges'],
+      },
+      routes: [{
+        id: 'default',
+        when: {},
+        signature: 'default',
+        status: 'learned',
+        actions: [],
+        expectation: null,
+      }],
+    }],
+  }, null, 2), 'utf8');
+  const compiled = JSON.parse(compile(
+    '--prompt-key', prepared.prompt.key, '--file', relativeCompiler,
+  ));
+  assert.equal(compiled.nodes[0].risk, 'irreversible');
+  assert.equal(compiled.nodes[0].barrier, 'none');
+  assert.equal(compiled.nodes[0].authorization.mode, 'prompt');
+  id = runId(run(
+    'init', '--summary', 'Submit two resources', '--name', 'prompt-authorized-write',
+    '--prompt-key', prepared.prompt.key, '--input', 'num=2',
+  ));
+
+  const dryRun = JSON.parse(execute('--run', id, '--dry-run', 'true'));
+  assert.equal(dryRun.status, 'ready');
+  assert.equal(dryRun.executed[0].authorizationMode, 'prompt');
+  assert.equal(dryRun.executed[0].authorizedCount, 2);
+
+  const completed = JSON.parse(execute('--run', id));
+  assert.equal(completed.status, 'workflow-segment-complete');
+  assert.equal(completed.executed[0].nodeId, 'submit-resources');
+  const state = JSON.parse(run('show', '--run', id));
+  assert.equal(state.status, 'active');
+  assert.equal(state.plan[0].status, 'completed');
+  assert.deepEqual(state.authorizations, {});
 });
 
 test('page switching and coordinate vision actions are batchable cached operations', async (t) => {
@@ -1028,6 +1104,8 @@ test('official Playwright Skill and prompt-first project guidance are present', 
   assert.match(guidance, /parameterized Workflow Recipe/);
   assert.match(guidance, /workflow commit/);
   assert.match(guidance, /Do not pre-check and post-check every cached click or fill/);
+  assert.match(guidance, /num=N.*bounded batch/i);
+  assert.match(guidance, /risk.*authorization.*barrier/i);
   assert.match(guidance, /pnpm execute/);
   assert.match(guidance, /Prompt paragraph order is a soft hint/);
   assert.equal(existsSync(join(root, 'workflows')), false);

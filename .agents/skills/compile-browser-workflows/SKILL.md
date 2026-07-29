@@ -11,7 +11,13 @@ the user to author nodes, selectors, YAML, or a business Skill.
 ## Compile
 
 1. Extract run inputs, required outputs, business facts, conditions, policies, irreversible actions,
-   and human checkpoints from the whole Prompt. Do not translate sentences one by one.
+   authorization scope, and human checkpoints from the whole Prompt. Do not translate sentences
+   one by one. Separate:
+   - `risk`: impact of the operation;
+   - `authorization`: whether the Prompt already authorizes its bounded scope;
+   - `barrier`: whether execution must stop for runtime participation.
+   An explicit instruction such as “submit `num` resources” is prompt authorization for that
+   bounded batch, including generated values that satisfy the Prompt's constraints.
 2. Work backwards from outputs and decisions to identify every required fact and its Web source.
    Classify each produced value:
    - `collects`: read from the visible page by a cached extract action;
@@ -23,6 +29,9 @@ the user to author nodes, selectors, YAML, or a business Skill.
 4. Preserve hard ordering from data dependencies, explicit before/after rules, authentication,
    human checkpoints, context changes, and irreversible actions. Treat paragraph order as a soft
    hint.
+   Do not introduce a confirmation barrier merely because an operation is irreversible.
+   Use `authorization.mode=runtime` only when the Prompt requests review/approval or the operation
+   requires authority beyond the Prompt's declared target, count, constraints, or environment.
 5. Put all compatible reads and reversible actions for the same affinity into one candidate
    transaction. Split only at a navigation state that changes the affinity or at a declared
    barrier.
@@ -59,7 +68,7 @@ pnpm execute -- --run <run-id>
 ```
 
 Do not return to the model between successful transactions. Continue until the executor reports a
-human or unconfirmed risk barrier; missing routing facts; a cache mismatch; or the end of the
+declared human or runtime-confirmation barrier; missing routing facts; a cache mismatch; or the end of the
 workflow segment. Cached decision and report nodes execute locally.
 
 On `repair-required`, inspect only the failed transaction and relevant page region, repair or learn

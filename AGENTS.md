@@ -73,7 +73,7 @@ configuration file, selector map, or project-specific script before starting.
 - On a valid recipe and page-variant hit, execute the continuous cached browser segment through
   `pnpm execute -- --run <run-id>`. It executes successive page transactions, commits their
   resumable boundaries, resolves cached decision and report nodes locally, and stops only for a
-  human or unconfirmed risk boundary, missing route fact, cache mismatch, or the end of the
+  declared human or runtime-confirmation boundary, missing route fact, cache mismatch, or the end of the
   segment. Do not return to the model between successful transactions.
 - Use `pnpm run recipe -- --run <run-id> --node <node-id>` only to learn, test, repair, or resume a
   single failed transaction.
@@ -109,7 +109,21 @@ configuration file, selector map, or project-specific script before starting.
 ## Safety
 
 - Do not guess business values or claim success without visible evidence.
-- Before an irreversible or high-impact action such as submitting a CR, publishing, approving, paying, or starting a production release, show the pending result and obtain explicit user confirmation in the current conversation.
-- Record confirmation only after the user confirms the exact pending action. Facts, decisions, or outputs changed after confirmation invalidate that confirmation and require a new review.
+- Treat an explicit Prompt instruction to create, submit, update, or repeat an external write as
+  authorization for that action within the Prompt's declared target, count, and value constraints.
+  `num=N` authorizes the complete bounded batch; generated values that remain inside declared
+  rules do not require per-item confirmation.
+- Keep `risk`, `authorization`, and `barrier` independent. Risk describes impact; authorization
+  describes the approved scope; a barrier alone determines whether execution pauses.
+- Compile an explicitly requested write with `authorization.mode=prompt`. Use
+  `authorization.mode=runtime` and a risk barrier only when the Prompt asks for review or approval,
+  when the exact action is outside the original authorization envelope, or when a materially
+  different target, count, environment, or impact is discovered at runtime.
+- Payments, production releases, approvals on behalf of another person, and other materially
+  high-impact actions require runtime confirmation unless the current Prompt explicitly and
+  unambiguously authorizes that exact bounded action.
+- Record every submitted item's actual values and visible result as evidence. A valid prompt
+  authorization does not become invalid merely because constrained random values were generated.
+  Runtime confirmations remain invalidated when their reviewed facts, decisions, or outputs change.
 - Treat the current prompt as the complete source of workflow-specific steps, facts, policies, expected results, and constraints.
 - A new workflow requires no repository changes.

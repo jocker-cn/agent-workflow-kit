@@ -226,6 +226,45 @@ function hasValidAuthorization(run, nodeId) {
   return Boolean(authorization && !authorization.invalidatedAt);
 }
 
+function authorizationMode(node) {
+  return node.authorization?.mode
+    ?? (node.barrier === 'risk' ? 'runtime' : node.risk === 'read' ? 'not-required' : 'prompt');
+}
+
+function validateAuthorizationEnvelope(node, run, explicitValues) {
+  if (authorizationMode(node) !== 'prompt') return { valid: true, count: null };
+  const authorization = node.authorization ?? {};
+  const values = transactionValues(run, explicitValues);
+  const rawCount = authorization.countFrom
+    ? nestedValue(values, authorization.countFrom)
+    : authorization.count;
+  if (authorization.countFrom && rawCount === undefined) {
+    return {
+      valid: false,
+      reason: `Prompt authorization for ${node.id} requires input ${authorization.countFrom}`,
+    };
+  }
+  if (rawCount === null || rawCount === undefined || rawCount === '') {
+    return { valid: true, count: null };
+  }
+  const count = Number(rawCount);
+  if (!Number.isInteger(count) || count < 1) {
+    return {
+      valid: false,
+      reason: `Prompt authorization count for ${node.id} must be a positive integer`,
+    };
+  }
+  if (authorization.maxCount !== null
+    && authorization.maxCount !== undefined
+    && count > authorization.maxCount) {
+    return {
+      valid: false,
+      reason: `Prompt authorization count ${count} exceeds maxCount ${authorization.maxCount} for ${node.id}`,
+    };
+  }
+  return { valid: true, count };
+}
+
 function wasHumanStepResumed(run, nodeId) {
   return run.status === 'active'
     && run.waitHistory?.some((item) => item.step === nodeId && item.resumedAt);
@@ -366,7 +405,30 @@ async function main() {
       return;
     }
 
-    if ((node.barrier === 'risk' || node.risk === 'irreversible') && !hasValidAuthorization(run, node.id)) {
+    const authorizationEnvelope = validateAuthorizationEnvelope(node, run, explicitValues);
+    if (!authorizationEnvelope.valid) {
+      if (!dryRun) {
+        await writeAndCommit(runId, {
+          ...localBoundary(node, null, 'blocked'),
+          runStatus: 'repair_required',
+        });
+      }
+      console.log(JSON.stringify({
+        status: 'repair-required',
+        runId,
+        executed,
+        skipped,
+        failedNode: node.id,
+        failure: { reason: authorizationEnvelope.reason },
+        resume: { from: node.id },
+      }, null, 2));
+      process.exitCode = 2;
+      return;
+    }
+
+    const requiresRuntimeAuthorization = authorizationMode(node) === 'runtime'
+      || node.barrier === 'risk';
+    if (requiresRuntimeAuthorization && !hasValidAuthorization(run, node.id)) {
       if (!dryRun) {
         await pauseAtBoundary(
           runId,
@@ -385,6 +447,7 @@ async function main() {
           type: node.type,
           barrier: 'risk',
           risk: node.risk,
+          authorization: node.authorization,
           description: node.description,
         },
       }, null, 2));
@@ -430,6 +493,8 @@ async function main() {
         type: node.type,
         routeId: selectedRoute.routeId,
         actionCount: selectedRoute.actions.length,
+        authorizationMode: authorizationMode(node),
+        authorizedCount: authorizationEnvelope.count,
         mode: 'dry-run',
       });
       continue;

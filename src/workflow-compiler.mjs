@@ -17,6 +17,7 @@ import {
 const NODE_TYPES = new Set(['browser', 'decision', 'human', 'report']);
 const BARRIERS = new Set(['none', 'human', 'decision', 'risk', 'context']);
 const RISKS = new Set(['read', 'reversible', 'irreversible']);
+const AUTHORIZATION_MODES = new Set(['not-required', 'prompt', 'runtime']);
 
 function usage(exitCode = 0) {
   console.log(`
@@ -112,16 +113,67 @@ function affinityKey(affinity = {}) {
   ].join('\0');
 }
 
+function normalizeAuthorization(raw, { id, risk, requestedBarrier }) {
+  const source = typeof raw === 'string' ? { mode: raw } : raw;
+  let mode = source?.mode;
+  if (!mode) {
+    if (requestedBarrier === 'risk' || (requestedBarrier === 'human' && risk !== 'read')) mode = 'runtime';
+    else if (risk === 'read') mode = 'not-required';
+    else if (risk === 'reversible') mode = 'prompt';
+    else throw new Error(
+      `Irreversible transaction ${id} must declare authorization.mode as prompt or runtime`,
+    );
+  }
+  if (!AUTHORIZATION_MODES.has(mode)) {
+    throw new Error(`Unsupported authorization mode: ${mode}`);
+  }
+  if (risk === 'irreversible' && mode === 'not-required') {
+    throw new Error(`Irreversible transaction ${id} cannot use authorization.mode not-required`);
+  }
+  const count = source?.count;
+  if (count !== undefined && (!Number.isInteger(count) || count < 1)) {
+    throw new Error(`${id}.authorization.count must be a positive integer`);
+  }
+  const maxCount = source?.maxCount;
+  if (maxCount !== undefined && (!Number.isInteger(maxCount) || maxCount < 1)) {
+    throw new Error(`${id}.authorization.maxCount must be a positive integer`);
+  }
+  return {
+    mode,
+    scope: source?.scope?.trim() || id,
+    count: count ?? null,
+    countFrom: source?.countFrom?.trim() || '',
+    maxCount: maxCount ?? null,
+    constraints: unique(source?.constraints),
+  };
+}
+
 function normalizeTransaction(raw, index) {
   const id = safeName(raw.id, `transactions[${index}].id`);
   const type = raw.type ?? 'browser';
-  const barrier = raw.barrier ?? (type === 'human' ? 'human' : type === 'decision' ? 'decision' : 'none');
   const risk = raw.risk ?? 'read';
   if (!NODE_TYPES.has(type)) throw new Error(`Unsupported transaction type: ${type}`);
-  if (!BARRIERS.has(barrier)) throw new Error(`Unsupported barrier: ${barrier}`);
   if (!RISKS.has(risk)) throw new Error(`Unsupported risk: ${risk}`);
-  if (risk === 'irreversible' && barrier === 'none') {
-    throw new Error(`Irreversible transaction ${id} must declare a risk or human barrier`);
+  const authorization = normalizeAuthorization(raw.authorization, {
+    id,
+    risk,
+    requestedBarrier: raw.barrier ?? (type === 'human' ? 'human' : undefined),
+  });
+  const barrier = raw.barrier ?? (
+    type === 'human'
+      ? 'human'
+      : authorization.mode === 'runtime'
+        ? 'risk'
+        : type === 'decision'
+          ? 'decision'
+          : 'none'
+  );
+  if (!BARRIERS.has(barrier)) throw new Error(`Unsupported barrier: ${barrier}`);
+  if (authorization.mode === 'runtime' && !['risk', 'human'].includes(barrier)) {
+    throw new Error(`Runtime authorization for ${id} requires a risk or human barrier`);
+  }
+  if (authorization.mode === 'prompt' && barrier === 'risk') {
+    throw new Error(`Prompt-authorized transaction ${id} cannot also declare a risk barrier`);
   }
   return {
     id,
@@ -143,6 +195,7 @@ function normalizeTransaction(raw, index) {
     after: unique(raw.after).map((value) => safeName(value, `${id}.after`)),
     barrier,
     risk,
+    authorization,
     operations: (raw.operations ?? []).map((operation, operationIndex) => ({
       id: safeName(operation.id ?? `operation-${operationIndex + 1}`, `${id}.operations.id`),
       kind: operation.kind ?? 'interact',
@@ -227,6 +280,11 @@ function canFuse(left, right) {
     && right.barrier === 'none'
     && left.risk !== 'irreversible'
     && right.risk !== 'irreversible'
+    && left.authorization.mode === right.authorization.mode
+    && (
+      left.authorization.mode === 'not-required'
+      || JSON.stringify(left.authorization) === JSON.stringify(right.authorization)
+    )
     && left.routes.length === 0
     && right.routes.length === 0
     && affinityKey(left.affinity) === affinityKey(right.affinity);
@@ -298,6 +356,7 @@ export function compileWorkflowSpec(spec) {
     after: node.after,
     barrier: node.barrier,
     risk: node.risk,
+    authorization: node.authorization,
     operations: node.operations,
     sourceNodeIds: node.sourceNodeIds,
     executionOrder: index,
@@ -444,7 +503,7 @@ async function main() {
     };
   });
   compiled.migrationWarnings = migrationWarnings;
-  definition.schemaVersion = 4;
+  definition.schemaVersion = 5;
   definition.compiled = {
     ...definition.compiled,
     ...compiled,
@@ -459,13 +518,17 @@ async function main() {
     optimization: compiled.optimization,
     validationWarnings: compiled.validationWarnings,
     migrationWarnings,
-    nodes: compiled.nodes.map(({ id, title, affinity, requires, produces, barrier, sourceNodeIds }) => ({
+    nodes: compiled.nodes.map(({
+      id, title, affinity, requires, produces, barrier, risk, authorization, sourceNodeIds,
+    }) => ({
       id,
       title,
       affinity,
       requires,
       produces,
       barrier,
+      risk,
+      authorization,
       sourceNodeIds,
     })),
   }, null, 2));

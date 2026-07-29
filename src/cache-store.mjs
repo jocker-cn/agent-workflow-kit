@@ -105,7 +105,7 @@ export async function ensurePromptCache(identity) {
   if (!existsSync(paths.definitionPath)) {
     const now = new Date().toISOString();
     await atomicWriteJson(paths.definitionPath, {
-      schemaVersion: 4,
+      schemaVersion: 5,
       prompt: identity,
       compiled: {
         version: 1,
@@ -191,6 +191,14 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
     node.collects ??= [];
     node.asserts ??= [];
     node.computes ??= [];
+    node.authorization ??= {
+      mode: node.barrier === 'risk' ? 'runtime' : node.risk === 'read' ? 'not-required' : 'prompt',
+      scope: node.id,
+      count: null,
+      countFrom: '',
+      maxCount: null,
+      constraints: [],
+    };
     node.dependsOn ??= [];
     node.routes ??= [];
     const enabled = node.routes.filter((route) => route.status !== 'disabled');
@@ -251,6 +259,7 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
       computes: node.computes,
       barrier: node.barrier ?? 'none',
       risk: node.risk ?? 'read',
+      authorization: node.authorization,
       routeId: route.id,
       routeSignature: route.signature,
       actions: route.actions,

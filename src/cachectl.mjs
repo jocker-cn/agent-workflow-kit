@@ -34,6 +34,9 @@ const ACTION_OPERATIONS = new Set([
 const LOCATOR_KINDS = new Set(['role', 'text', 'label', 'placeholder', 'testid']);
 const NODE_TYPES = new Set(['browser', 'decision', 'human', 'report']);
 const ROUTE_STATUSES = new Set(['learned', 'unlearned', 'disabled']);
+const BARRIERS = new Set(['none', 'human', 'decision', 'risk', 'context']);
+const RISKS = new Set(['read', 'reversible', 'irreversible']);
+const AUTHORIZATION_MODES = new Set(['not-required', 'prompt', 'runtime']);
 
 function usage(exitCode = 0) {
   console.log(`
@@ -48,6 +51,11 @@ Commands:
   recipe-node [prompt selection] --id <node-id> --title <text>
               [--description <text>] [--node-class <browser|decision|human|report>]
               [--depends-on <fact-key>]...
+              [--risk <read|reversible|irreversible>]
+              [--barrier <none|human|decision|risk|context>]
+              [--authorization-mode <not-required|prompt|runtime>]
+              [--authorization-scope <text>] [--authorization-count-from <input-key>]
+              [--authorization-count <count>] [--authorization-max-count <count>]
   recipe-route [prompt selection] --node <node-id> --id <route-id>
                [--when key=value]... [--action <page-id>[@variant]/<action-name>]...
                [--postcondition <text>]
@@ -170,7 +178,7 @@ function expandAssignments(assignments) {
 }
 
 function bumpRecipe(definition) {
-  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 4);
+  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 5);
   definition.compiled.version += 1;
   definition.updatedAt = new Date().toISOString();
 }
@@ -249,7 +257,7 @@ function compilationStatus(definition) {
   const normalized = normalizeDefinition(definition);
   if (normalized.compiled.nodes.length === 0) return 'uncompiled';
   if (
-    normalized.schemaVersion < 4
+    normalized.schemaVersion < 5
     || normalized.compiled.nodes.some((node) => !node.description || !node.affinity)
   ) {
     return 'needs-recompile';
@@ -349,12 +357,52 @@ async function main() {
     }
     const now = new Date().toISOString();
     const existing = definition.compiled.nodes.find((node) => node.id === id);
+    const risk = one(flags, 'risk', false) ?? existing?.risk ?? 'read';
+    const authorizationMode = one(flags, 'authorization-mode', false)
+      ?? existing?.authorization?.mode
+      ?? (risk === 'read' ? 'not-required' : 'prompt');
+    const barrier = one(flags, 'barrier', false)
+      ?? existing?.barrier
+      ?? (authorizationMode === 'runtime' ? 'risk' : 'none');
+    if (!RISKS.has(risk)) throw new Error(`Unsupported risk: ${risk}`);
+    if (!BARRIERS.has(barrier)) throw new Error(`Unsupported barrier: ${barrier}`);
+    if (!AUTHORIZATION_MODES.has(authorizationMode)) {
+      throw new Error(`Unsupported authorization mode: ${authorizationMode}`);
+    }
+    if (risk === 'irreversible' && authorizationMode === 'not-required') {
+      throw new Error('Irreversible actions require prompt or runtime authorization');
+    }
+    if (authorizationMode === 'runtime' && !['risk', 'human'].includes(barrier)) {
+      throw new Error('Runtime authorization requires a risk or human barrier');
+    }
+    if (authorizationMode === 'prompt' && barrier === 'risk') {
+      throw new Error('Prompt authorization cannot also declare a risk barrier');
+    }
+    const numericFlag = (name, fallback = null) => {
+      const value = one(flags, name, false);
+      if (value === undefined) return fallback;
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`--${name} must be a positive integer`);
+      return parsed;
+    };
     const node = {
       ...existing,
       id,
       title: one(flags, 'title'),
       description: one(flags, 'description', false) ?? existing?.description ?? one(flags, 'title'),
       type,
+      risk,
+      barrier,
+      authorization: {
+        mode: authorizationMode,
+        scope: one(flags, 'authorization-scope', false) ?? existing?.authorization?.scope ?? id,
+        count: numericFlag('authorization-count', existing?.authorization?.count ?? null),
+        countFrom: one(flags, 'authorization-count-from', false)
+          ?? existing?.authorization?.countFrom
+          ?? '',
+        maxCount: numericFlag('authorization-max-count', existing?.authorization?.maxCount ?? null),
+        constraints: existing?.authorization?.constraints ?? [],
+      },
       dependsOn: [...new Set(flags['depends-on'] ?? existing?.dependsOn ?? [])].sort(),
       routes: existing?.routes ?? [],
       createdAt: existing?.createdAt ?? now,

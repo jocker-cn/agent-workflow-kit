@@ -279,6 +279,8 @@ function compiledWorkflowText(compiled) {
       requires: node.requires,
       produces: node.produces,
       barrier: node.barrier,
+      risk: node.risk,
+      authorization: node.authorization,
     })),
   });
 }
