@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { readFile, rm } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
+  CACHE_ROOT,
   ROOT,
   atomicWriteJson,
   cacheDisplayPaths,
@@ -18,9 +19,17 @@ import {
   routeSignature,
 } from './cache-store.mjs';
 
-const ACTION_STRATEGIES = new Set(['locator', 'css', 'vision']);
+const ACTION_STRATEGIES = new Set(['locator', 'css', 'vision', 'page']);
 const ACTION_RESULTS = new Set(['success', 'failure']);
-const ACTION_OPERATIONS = new Set(['click', 'fill', 'select', 'check', 'uncheck', 'extract']);
+const ACTION_OPERATIONS = new Set([
+  'click',
+  'fill',
+  'select',
+  'check',
+  'uncheck',
+  'extract',
+  'switch-page',
+]);
 const LOCATOR_KINDS = new Set(['role', 'text', 'label', 'placeholder', 'testid']);
 const NODE_TYPES = new Set(['browser', 'decision', 'human', 'report']);
 const ROUTE_STATUSES = new Set(['learned', 'unlearned', 'disabled']);
@@ -35,7 +44,8 @@ Commands:
   show [--prompt <file> | --prompt-key <key>]
   recipe-show [prompt selection]
   recipe-node [prompt selection] --id <node-id> --title <text>
-              [--node-class <browser|decision|human|report>] [--depends-on <fact-key>]...
+              [--description <text>] [--node-class <browser|decision|human|report>]
+              [--depends-on <fact-key>]...
   recipe-route [prompt selection] --node <node-id> --id <route-id>
                [--when key=value]... [--action <page-id>[@variant]/<action-name>]...
                [--postcondition <text>]
@@ -50,25 +60,30 @@ Commands:
             [--title <text>] [--anchor <text>]... [--viewport <width>x<height>]
   page-show [prompt selection] --page <page-id> [--variant <variant-id>]
   action-learn [prompt selection] --page <page-id> --name <action-name>
-               --strategy <locator|css|vision> --target <value> --postcondition <text>
+               --strategy <locator|css|vision|page> --target <value> --postcondition <text>
                [--variant <variant-id>] [--operation <operation>]
                [--locator-kind <role|text|label|placeholder|testid>] [--role <aria-role>]
                [--value-from <input-or-fact-key>] [--extract-to <fact-key>]
+               [--extract-attribute <attribute-name>] [--tab-role <role-name>]
   action-result [prompt selection] --page <page-id> --name <action-name>
                 --candidate <candidate-id> --status <success|failure>
                 [--variant <variant-id>] [--reason <text>] [timing fields]
   action-result-batch [prompt selection] --file <project-relative-json>
   page-invalidate [prompt selection] --page <page-id> [--variant <variant-id>] --reason <text>
+  clear [prompt selection] [--scope <current|pages|workflow>] [--apply <true|false>]
 
 Prompt selection is --prompt <path> or the shell-safe --prompt-key <key>. If the workspace has
 exactly one Prompt file, selection can be omitted.
 
-Definitions and page actions are isolated by both prompt file identity and prompt content hash.
-Changing a prompt automatically creates a new cache version. Snapshot refs, secrets, and run
-variables must never be cached.
+Definitions are versioned by Prompt content hash. Page actions are reusable across versions of the
+same Prompt file. Snapshot refs, secrets, and run variables must never be cached.
 
 Workflow recipes contain reusable nodes and locally guarded routes. Business instance values such
 as order.id stay in run state; only values that change the path belong in route --when guards.
+
+clear is preview-only unless --apply true is supplied. "current" removes the current definition
+version, "pages" removes reusable page caches, and "workflow" removes all definition versions and
+page caches belonging to the selected Prompt file.
 `);
   process.exit(exitCode);
 }
@@ -145,7 +160,7 @@ function expandAssignments(assignments) {
 }
 
 function bumpRecipe(definition) {
-  definition.schemaVersion = 2;
+  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 3);
   definition.compiled.version += 1;
   definition.updatedAt = new Date().toISOString();
 }
@@ -220,6 +235,18 @@ async function loadPage(paths, pageId) {
   return { path, page: normalizePage(await readJson(path)) };
 }
 
+function compilationStatus(definition) {
+  const normalized = normalizeDefinition(definition);
+  if (normalized.compiled.nodes.length === 0) return 'uncompiled';
+  if (
+    normalized.schemaVersion < 3
+    || normalized.compiled.nodes.some((node) => !node.description || !node.affinity)
+  ) {
+    return 'needs-recompile';
+  }
+  return 'ready';
+}
+
 async function main() {
   const { command, flags } = parseArgs(process.argv.slice(2));
   if (!command || command === 'help' || command === '--help') usage();
@@ -229,12 +256,55 @@ async function main() {
     return;
   }
 
+  if (command === 'clear') {
+    const identity = await resolvePromptSelection({
+      prompt: one(flags, 'prompt', false),
+      promptKey: one(flags, 'prompt-key', false),
+    });
+    const paths = cachePaths(identity);
+    const scope = one(flags, 'scope', false) ?? 'current';
+    if (!['current', 'pages', 'workflow'].includes(scope)) {
+      throw new Error('--scope must be current, pages, or workflow');
+    }
+    const definitionRoot = dirname(paths.definitionPath);
+    const pagesRoot = join(CACHE_ROOT, 'pages', identity.key);
+    const targets = scope === 'current'
+      ? [paths.definitionPath]
+      : scope === 'pages'
+        ? [pagesRoot]
+        : [definitionRoot, pagesRoot];
+    for (const target of targets) {
+      const relativeTarget = relative(CACHE_ROOT, resolve(target));
+      if (relativeTarget.startsWith('..') || isAbsolute(relativeTarget) || relativeTarget === '') {
+        throw new Error(`Refusing to clear unsafe cache target: ${target}`);
+      }
+    }
+    const apply = (one(flags, 'apply', false) ?? 'false') === 'true';
+    const result = {
+      status: apply ? 'cleared' : 'preview',
+      scope,
+      prompt: identity,
+      targets: targets.map((target) => relative(ROOT, target).replaceAll('\\', '/')),
+      existingTargets: targets
+        .filter((target) => existsSync(target))
+        .map((target) => relative(ROOT, target).replaceAll('\\', '/')),
+    };
+    if (apply) {
+      await Promise.all(targets.map((target) => rm(target, { recursive: true, force: true })));
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   const { identity, paths } = await loadScope(flags);
 
   if (command === 'prepare') {
+    const definition = await readJson(paths.definitionPath);
     console.log(JSON.stringify({
       prompt: identity,
       cache: cacheDisplayPaths(paths),
+      compilerStatus: compilationStatus(definition),
+      recipeVersion: normalizeDefinition(definition).compiled.version,
     }, null, 2));
     return;
   }
@@ -270,8 +340,10 @@ async function main() {
     const now = new Date().toISOString();
     const existing = definition.compiled.nodes.find((node) => node.id === id);
     const node = {
+      ...existing,
       id,
       title: one(flags, 'title'),
+      description: one(flags, 'description', false) ?? existing?.description ?? one(flags, 'title'),
       type,
       dependsOn: [...new Set(flags['depends-on'] ?? existing?.dependsOn ?? [])].sort(),
       routes: existing?.routes ?? [],
@@ -467,6 +539,19 @@ async function main() {
     if (operation === 'extract' && !one(flags, 'extract-to', false)) {
       throw new Error('extract actions require --extract-to');
     }
+    if (strategy === 'vision' && (operation !== 'click' || !/^\d+,\d+$/.test(one(flags, 'target')))) {
+      throw new Error('Vision fast-path actions currently require --operation click and --target x,y');
+    }
+    if (strategy === 'page' && operation !== 'switch-page') {
+      throw new Error('Page strategy requires --operation switch-page and a URL glob target');
+    }
+    if (operation === 'switch-page' && strategy !== 'page') {
+      throw new Error('switch-page actions require --strategy page');
+    }
+    const extractAttribute = one(flags, 'extract-attribute', false) ?? '';
+    if (extractAttribute && !/^[A-Za-z_:][-A-Za-z0-9_:.]*$/.test(extractAttribute)) {
+      throw new Error('--extract-attribute must be a valid HTML attribute name');
+    }
     const target = one(flags, 'target');
     const locatorKind = one(flags, 'locator-kind', false);
     if (locatorKind && !LOCATOR_KINDS.has(locatorKind)) {
@@ -484,6 +569,9 @@ async function main() {
             ...(locatorKind === 'role' ? { role: one(flags, 'role', false) } : {}),
           }
         : null;
+    const point = strategy === 'vision'
+      ? Object.fromEntries(['x', 'y'].map((key, index) => [key, Number(target.split(',')[index])]))
+      : null;
     const id = candidateId(strategy, selector ? JSON.stringify(selector) : target);
     const now = new Date().toISOString();
     const action = variant.actions[name] ??= {
@@ -491,6 +579,8 @@ async function main() {
       operation,
       valueFrom: '',
       extractTo: '',
+      extractAttribute: '',
+      tabRole: '',
       postcondition: '',
       candidates: [],
       createdAt: now,
@@ -499,6 +589,8 @@ async function main() {
     action.operation = operation;
     action.valueFrom = one(flags, 'value-from', false) ?? action.valueFrom ?? '';
     action.extractTo = one(flags, 'extract-to', false) ?? action.extractTo ?? '';
+    action.extractAttribute = extractAttribute || action.extractAttribute || '';
+    action.tabRole = one(flags, 'tab-role', false) ?? action.tabRole ?? '';
     action.postcondition = one(flags, 'postcondition');
     const existing = action.candidates.find((candidate) => candidate.id === id);
     if (existing) {
@@ -510,6 +602,7 @@ async function main() {
         strategy,
         target,
         ...(selector ? { selector } : {}),
+        ...(point ? { point } : {}),
         successCount: 0,
         failureCount: 0,
         consecutiveFailures: 0,

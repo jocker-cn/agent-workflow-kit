@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export const ROOT = resolve(process.cwd());
@@ -73,7 +73,8 @@ export async function resolvePromptSelection({ prompt, promptKey } = {}) {
 export function cachePaths(identity) {
   return {
     definitionPath: join(CACHE_ROOT, 'definitions', identity.key, `${identity.hash}.json`),
-    pagesDir: join(CACHE_ROOT, 'pages', identity.key, identity.hash),
+    pagesDir: join(CACHE_ROOT, 'pages', identity.key, 'shared'),
+    legacyPagesDir: join(CACHE_ROOT, 'pages', identity.key, identity.hash),
   };
 }
 
@@ -91,13 +92,33 @@ export async function readJson(path) {
 export async function ensurePromptCache(identity) {
   const paths = cachePaths(identity);
   await mkdir(paths.pagesDir, { recursive: true });
+  if (existsSync(paths.legacyPagesDir)) {
+    const legacyPages = (await readdir(paths.legacyPagesDir, { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.json'));
+    await Promise.all(legacyPages.map(async (entry) => {
+      const destination = join(paths.pagesDir, entry.name);
+      if (!existsSync(destination)) {
+        await copyFile(join(paths.legacyPagesDir, entry.name), destination);
+      }
+    }));
+  }
   if (!existsSync(paths.definitionPath)) {
     const now = new Date().toISOString();
     await atomicWriteJson(paths.definitionPath, {
-      schemaVersion: 2,
+      schemaVersion: 3,
       prompt: identity,
       compiled: {
         version: 1,
+        workflow: {
+          name: '',
+          summary: '',
+          description: '',
+        },
+        inputs: [],
+        facts: [],
+        outputs: [],
+        policies: [],
+        constraints: [],
         nodes: [],
         steps: [],
         branches: [],
@@ -131,6 +152,16 @@ export function normalizeDefinition(definition) {
   definition.schemaVersion ??= 1;
   definition.compiled ??= {};
   definition.compiled.version ??= 1;
+  definition.compiled.workflow ??= {
+    name: '',
+    summary: '',
+    description: '',
+  };
+  definition.compiled.inputs ??= [];
+  definition.compiled.facts ??= [];
+  definition.compiled.outputs ??= [];
+  definition.compiled.policies ??= [];
+  definition.compiled.constraints ??= [];
   definition.compiled.nodes ??= [];
   definition.compiled.steps ??= [];
   definition.compiled.branches ??= [];
@@ -141,6 +172,13 @@ function nestedValue(values, dottedKey) {
   return dottedKey.split('.').reduce((current, part) => current?.[part], values);
 }
 
+function normalizedScalar(value) {
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number' || typeof value === 'bigint') return String(value);
+  return value;
+}
+
 export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) {
   const resolved = [];
   const pending = [];
@@ -148,15 +186,30 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
   const ambiguous = [];
   for (const node of normalizeDefinition(definition).compiled.nodes) {
     if (onlyNode && node.id !== onlyNode) continue;
+    node.requires ??= [];
+    node.produces ??= [];
+    node.collects ??= [];
+    node.dependsOn ??= [];
+    node.routes ??= [];
     const enabled = node.routes.filter((route) => route.status !== 'disabled');
     const conditional = enabled.filter((route) => Object.keys(route.when).length > 0);
     const candidates = (conditional.length > 0 ? conditional : enabled)
       .filter((route) => Object.entries(route.when)
-        .every(([key, expected]) => nestedValue(values, key) === expected))
+        .every(([key, expected]) => normalizedScalar(nestedValue(values, key)) === normalizedScalar(expected)))
       .sort((left, right) => Object.keys(right.when).length - Object.keys(left.when).length);
-    const missing = node.dependsOn.filter((key) => nestedValue(values, key) === undefined);
-    if (missing.length > 0 && conditional.length > 0) {
-      pending.push({ nodeId: node.id, dependsOn: node.dependsOn, missing });
+    const missingRouteFacts = conditional.length > 0
+      ? node.dependsOn.filter((key) => nestedValue(values, key) === undefined)
+      : [];
+    const missingRequirements = node.requires
+      .filter((key) => nestedValue(values, key) === undefined);
+    const missing = [...new Set([...missingRouteFacts, ...missingRequirements])];
+    if (missing.length > 0) {
+      pending.push({
+        nodeId: node.id,
+        dependsOn: node.dependsOn,
+        requires: node.requires,
+        missing,
+      });
       continue;
     }
     if (candidates.length === 0) {
@@ -186,7 +239,14 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
     resolved.push({
       nodeId: node.id,
       title: node.title,
+      description: node.description ?? '',
       type: node.type,
+      affinity: node.affinity ?? {},
+      requires: node.requires,
+      produces: node.produces,
+      collects: node.collects,
+      barrier: node.barrier ?? 'none',
+      risk: node.risk ?? 'read',
       routeId: route.id,
       routeSignature: route.signature,
       actions: route.actions,

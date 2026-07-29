@@ -4,11 +4,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
+import { compileWorkflowSpec } from '../src/workflow-compiler.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 const workflowctl = join(root, 'src', 'workflowctl.mjs');
 const cachectl = join(root, 'src', 'cachectl.mjs');
+const workflowCompiler = join(root, 'src', 'workflow-compiler.mjs');
 const recipeRunner = join(root, 'src', 'recipe-runner.mjs');
+const workflowRunner = join(root, 'src', 'workflow-runner.mjs');
 
 function run(...args) {
   return execFileSync(process.execPath, [workflowctl, ...args], {
@@ -26,10 +29,35 @@ function cache(...args) {
   });
 }
 
+function compile(...args) {
+  return execFileSync(process.execPath, [workflowCompiler, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
 function recipe(...args) {
   return execFileSync(process.execPath, [recipeRunner, ...args], {
     cwd: root,
     encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function execute(...args) {
+  return execFileSync(process.execPath, [workflowRunner, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function executeWithEnv(env, ...args) {
+  return execFileSync(process.execPath, [workflowRunner, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 }
@@ -182,7 +210,7 @@ test('a changed result invalidates an earlier confirmation', async (t) => {
   assert.match(state, /Output changed: cr.id/);
 });
 
-test('definition and page caches are isolated by prompt identity and content version', async (t) => {
+test('definitions are versioned while page caches are reused only within one prompt identity', async (t) => {
   const suffix = `${process.pid}-${Date.now()}`;
   const promptDir = join(root, '.github', 'prompts');
   const promptAPath = join(promptDir, `cache-a-${suffix}.prompt.md`);
@@ -287,6 +315,10 @@ test('definition and page caches are isolated by prompt identity and content ver
   assert.equal(updatedA.prompt.key, preparedA.prompt.key);
   assert.notEqual(updatedA.prompt.hash, preparedA.prompt.hash);
   assert.notEqual(updatedA.prompt.scope, preparedA.prompt.scope);
+  const reusedPage = JSON.parse(cache(
+    'page-show', '--prompt-key', updatedA.prompt.key, '--page', 'order-details',
+  ));
+  assert.equal(reusedPage.pageId, 'order-details');
 });
 
 test('parameterized recipes isolate type A and B routes and stop on an unknown type', async (t) => {
@@ -438,18 +470,543 @@ test('parameterized recipes isolate type A and B routes and stop on an unknown t
     value: 'Special approval',
     role: 'button',
   });
+  const continuousDryRun = JSON.parse(execute(
+    '--run', id, '--value', 'order.type=B', '--dry-run', 'true',
+  ));
+  assert.equal(continuousDryRun.status, 'ready');
+  assert.equal(continuousDryRun.executed.length, 1);
+  assert.equal(continuousDryRun.executed[0].nodeId, 'process-order');
+});
+
+test('workflow compiler reorders scattered prompt work by dependencies and fuses page affinity', () => {
+  const compiled = compileWorkflowSpec({
+    workflow: {
+      name: 'resource-validation',
+      description: 'Validate a resource across two sites',
+    },
+    transactions: [
+      {
+        id: 'search-resource',
+        title: 'Search the resource',
+        description: 'Apply filters on the result page',
+        affinity: {
+          system: 'jinsuitui',
+          page: 'video-resource-results',
+          state: 'filtered',
+          tab: 'main',
+        },
+        requires: ['session.authenticated'],
+        produces: ['search.exists'],
+        operations: [{ id: 'apply-filter', description: 'Apply the search filter' }],
+      },
+      {
+        id: 'verify-bilibili',
+        title: 'Verify Bilibili',
+        affinity: {
+          system: 'bilibili',
+          page: 'video',
+          state: 'loaded',
+          tab: 'resource',
+        },
+        requires: ['search.videoUrl'],
+        produces: ['video.author'],
+      },
+      {
+        id: 'collect-search-fields',
+        title: 'Collect fields mentioned later in the Prompt',
+        description: 'Collect the reference range and video URL from the existing result',
+        affinity: {
+          system: 'jinsuitui',
+          page: 'video-resource-results',
+          state: 'filtered',
+          tab: 'main',
+        },
+        requires: ['search.exists'],
+        produces: ['search.referenceFollowers', 'search.videoUrl'],
+        operations: [{ id: 'collect-fields', kind: 'collect', description: 'Collect all result fields' }],
+      },
+    ],
+  });
+
+  assert.equal(compiled.optimization.sourceTransactionCount, 3);
+  assert.equal(compiled.optimization.executableTransactionCount, 2);
+  assert.equal(compiled.optimization.fusedTransactionCount, 1);
+  assert.deepEqual(compiled.nodes[0].sourceNodeIds, ['search-resource', 'collect-search-fields']);
+  assert.deepEqual(compiled.nodes[0].produces, [
+    'search.exists',
+    'search.referenceFollowers',
+    'search.videoUrl',
+  ]);
+  assert.equal(compiled.nodes[1].id, 'verify-bilibili');
+  assert.equal(compiled.nodes[0].description.includes('reference range'), true);
+});
+
+test('recipe guards normalize scalar values from workflow facts', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `scalar-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/scalar-${suffix}.prompt.md`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Use a boolean result to select a route.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  t.after(async () => {
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  cache(
+    'recipe-node', '--prompt-key', prepared.prompt.key,
+    '--id', 'report-result', '--title', 'Report result',
+    '--node-class', 'report', '--depends-on', 'result.valid',
+  );
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'report-result', '--id', 'valid',
+    '--when', 'result.valid=true', '--status', 'learned',
+    '--postcondition', 'Report the valid result',
+  );
+  const definitionPath = join(
+    root,
+    '.workflow-cache',
+    'definitions',
+    prepared.prompt.key,
+    `${prepared.prompt.hash}.json`,
+  );
+  const definition = JSON.parse(readFileSync(definitionPath, 'utf8'));
+  const { resolveWorkflowRecipe } = await import('../src/cache-store.mjs');
+  const resolution = resolveWorkflowRecipe(definition, { result: { valid: true } });
+  assert.equal(resolution.status, 'ready');
+  assert.equal(resolution.resolved[0].routeId, 'valid');
+});
+
+test('cache clear previews exact targets and can clear pages or the complete prompt workflow', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `clear-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/clear-${suffix}.prompt.md`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Open a page and cache it.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  const definitionsRoot = join(root, '.workflow-cache', 'definitions', prepared.prompt.key);
+  const pagesRoot = join(root, '.workflow-cache', 'pages', prepared.prompt.key);
+  t.after(async () => {
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(definitionsRoot, { recursive: true, force: true }),
+      rm(pagesRoot, { recursive: true, force: true }),
+    ]);
+  });
+  cache(
+    'page-init', '--prompt-key', prepared.prompt.key,
+    '--page', 'cached-page', '--origin', 'https://example.com',
+    '--route', '/*', '--anchor', 'Example',
+  );
+
+  const preview = JSON.parse(cache(
+    'clear', '--prompt-key', prepared.prompt.key, '--scope', 'workflow',
+  ));
+  assert.equal(preview.status, 'preview');
+  assert.equal(existsSync(definitionsRoot), true);
+  assert.equal(existsSync(pagesRoot), true);
+
+  const clearedPages = JSON.parse(cache(
+    'clear', '--prompt-key', prepared.prompt.key,
+    '--scope', 'pages', '--apply', 'true',
+  ));
+  assert.equal(clearedPages.status, 'cleared');
+  assert.equal(existsSync(pagesRoot), false);
+  assert.equal(existsSync(definitionsRoot), true);
+
+  cache(
+    'clear', '--prompt-key', prepared.prompt.key,
+    '--scope', 'workflow', '--apply', 'true',
+  );
+  assert.equal(existsSync(definitionsRoot), false);
+});
+
+test('compiler safely merges learned routes when same-page transactions are fused', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `migration-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-migration-${suffix}.json`);
+  const relativePrompt = `.github/prompts/migration-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-migration-${suffix}.json`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Collect two fields from one result page.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  t.after(async () => {
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  cache(
+    'recipe-node', '--prompt-key', prepared.prompt.key,
+    '--id', 'search-resource', '--title', 'Search resource',
+  );
+  cache(
+    'recipe-node', '--prompt-key', prepared.prompt.key,
+    '--id', 'collect-fields', '--title', 'Collect fields',
+  );
+  cache(
+    'page-init', '--prompt-key', prepared.prompt.key,
+    '--page', 'result-page', '--origin', 'https://example.com',
+    '--route', '/results', '--anchor', 'Results',
+  );
+  cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'result-page', '--name', 'apply-filter',
+    '--strategy', 'locator', '--locator-kind', 'role', '--role', 'button',
+    '--target', 'Filter', '--operation', 'click', '--postcondition', 'Results visible',
+  );
+  cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'result-page', '--name', 'collect-result',
+    '--strategy', 'locator', '--locator-kind', 'text',
+    '--target', 'Result', '--operation', 'extract', '--extract-to', 'search.result',
+    '--postcondition', 'Result collected',
+  );
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'search-resource', '--id', 'default',
+    '--action', 'result-page/apply-filter', '--expect-action', 'result-page/apply-filter',
+  );
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'collect-fields', '--id', 'default',
+    '--action', 'result-page/collect-result', '--expect-action', 'result-page/collect-result',
+  );
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: {
+      name: 'migration-test',
+      description: 'Fuse compatible page transactions without losing learned routes',
+    },
+    transactions: [
+      {
+        id: 'search-resource',
+        title: 'Search resource',
+        affinity: { system: 'example', page: 'results', state: 'filtered', tab: 'main' },
+        produces: ['search.ready'],
+      },
+      {
+        id: 'collect-fields',
+        title: 'Collect fields',
+        affinity: { system: 'example', page: 'results', state: 'filtered', tab: 'main' },
+        after: ['search-resource'],
+        produces: ['search.result'],
+        collects: ['search.result'],
+      },
+    ],
+  }, null, 2), 'utf8');
+
+  const result = JSON.parse(compile(
+    '--prompt-key', prepared.prompt.key, '--file', relativeCompiler,
+  ));
+  assert.equal(result.optimization.fusedTransactionCount, 1);
+  assert.deepEqual(result.migrationWarnings, []);
+  const recipeDefinition = JSON.parse(cache('recipe-show', '--prompt-key', prepared.prompt.key));
+  assert.equal(recipeDefinition.nodes.length, 1);
+  assert.deepEqual(
+    recipeDefinition.nodes[0].routes[0].actions.map((action) => action.action),
+    ['apply-filter', 'collect-result'],
+  );
+  assert.equal(recipeDefinition.nodes[0].routes[0].expectation.action, 'collect-result');
+});
+
+test('continuous runner persists human boundaries then completes decision and report locally', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `local-runner-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-local-${suffix}.json`);
+  const relativePrompt = `.github/prompts/local-runner-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-local-${suffix}.json`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Wait for a human, choose a route, and report.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  const defaultRoute = {
+    id: 'default',
+    when: {},
+    signature: 'default',
+    status: 'learned',
+    actions: [],
+    postcondition: '',
+    expectation: null,
+  };
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: {
+      name: 'local-runner',
+      summary: 'Human and local nodes',
+      description: 'Descriptions must be available when a new Agent resumes the run',
+    },
+    transactions: [
+      {
+        id: 'human-check',
+        title: 'Wait for human',
+        description: 'Wait until the user finishes the visible verification step',
+        type: 'human',
+        barrier: 'human',
+      },
+      {
+        id: 'choose-route',
+        title: 'Choose route',
+        description: 'Resolve a cached decision without the model',
+        type: 'decision',
+        after: ['human-check'],
+        routes: [defaultRoute],
+      },
+      {
+        id: 'report-result',
+        title: 'Report result',
+        description: 'Render the result from saved facts',
+        type: 'report',
+        after: ['choose-route'],
+        routes: [defaultRoute],
+      },
+    ],
+  }, null, 2), 'utf8');
+  compile('--prompt-key', prepared.prompt.key, '--file', relativeCompiler);
+  id = runId(run(
+    'init', '--summary', 'Test local runner', '--name', 'local-runner',
+    '--prompt-key', prepared.prompt.key,
+  ));
+
+  const waiting = JSON.parse(execute('--run', id));
+  assert.equal(waiting.status, 'waiting');
+  assert.equal(JSON.parse(run('show', '--run', id)).status, 'waiting');
+  run('resume', '--run', id);
+  const completed = JSON.parse(execute('--run', id));
+  assert.equal(completed.status, 'workflow-segment-complete');
+  assert.deepEqual(
+    completed.executed.map((item) => item.nodeId),
+    ['human-check', 'choose-route', 'report-result'],
+  );
+  const state = JSON.parse(run('show', '--run', id));
+  assert.equal(state.status, 'active');
+  assert.equal(state.plan.every((step) => step.status === 'completed'), true);
+  assert.equal(state.decisions.at(-1).selected, 'default');
+  assert.equal(state.executionHistory.at(-1).kind, 'segment');
+  assert.match(run('context', '--run', id), /Descriptions must be available/);
+});
+
+test('continuous runner commits a failed browser transaction before returning repair-required', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `failure-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-failure-${suffix}.json`);
+  const fakeRunnerPath = join(root, `.fake-recipe-${suffix}.mjs`);
+  const relativePrompt = `.github/prompts/failure-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-failure-${suffix}.json`;
+  const relativeFakeRunner = `.fake-recipe-${suffix}.mjs`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Run one cached browser transaction.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(fakeRunnerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: { name: 'failure-test' },
+    transactions: [{
+      id: 'browser-step',
+      title: 'Browser step',
+      type: 'browser',
+      affinity: { system: 'example', page: 'home', state: 'ready', tab: 'main' },
+      routes: [{
+        id: 'default',
+        when: {},
+        signature: 'default',
+        status: 'learned',
+        actions: [],
+        postcondition: '',
+        expectation: null,
+      }],
+    }],
+  }, null, 2), 'utf8');
+  compile('--prompt-key', prepared.prompt.key, '--file', relativeCompiler);
+  id = runId(run(
+    'init', '--summary', 'Test failure state', '--name', 'failure-test',
+    '--prompt-key', prepared.prompt.key,
+  ));
+  await writeFile(fakeRunnerPath, `
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+const value = name => args[args.indexOf(name) + 1];
+const runId = value('--run');
+const nodeId = value('--node');
+const commitFile = \`.workflow-runs/\${runId}/last-boundary.json\`;
+await writeFile(join(process.cwd(), commitFile), JSON.stringify({
+  runStatus: 'repair_required',
+  step: { id: nodeId, title: 'Browser step', status: 'blocked', note: 'Synthetic failure' },
+  cursor: { step: nodeId, next: 'Repair browser step', system: 'example', url: 'https://example.com' },
+  telemetry: { kind: 'transaction', batchId: 'fake', nodeId, durationMs: 1, status: 'failure' }
+}));
+console.log(JSON.stringify({
+  status: 'failure',
+  routeId: 'default',
+  batchId: 'fake',
+  reason: 'Synthetic failure',
+  url: 'https://example.com',
+  results: [],
+  commitFile
+}));
+`, 'utf8');
+
+  assert.throws(
+    () => executeWithEnv({ AGENT_WORKFLOW_RECIPE_RUNNER: relativeFakeRunner }, '--run', id),
+  );
+  const state = JSON.parse(run('show', '--run', id));
+  assert.equal(state.status, 'repair_required');
+  assert.equal(state.plan[0].status, 'blocked');
+  assert.equal(state.cursor.currentStep, 'browser-step');
+});
+
+test('risk boundaries remain waiting until the exact node is confirmed', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `risk-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-risk-${suffix}.json`);
+  const relativePrompt = `.github/prompts/risk-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-risk-${suffix}.json`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Publish only after explicit confirmation.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: { name: 'risk-test' },
+    transactions: [{
+      id: 'publish-result',
+      title: 'Publish result',
+      description: 'Publish the exact reviewed result',
+      type: 'report',
+      barrier: 'risk',
+      risk: 'irreversible',
+      routes: [{
+        id: 'default',
+        when: {},
+        signature: 'default',
+        status: 'learned',
+        actions: [],
+        expectation: null,
+      }],
+    }],
+  }, null, 2), 'utf8');
+  compile('--prompt-key', prepared.prompt.key, '--file', relativeCompiler);
+  id = runId(run(
+    'init', '--summary', 'Test risk boundary', '--name', 'risk-test',
+    '--prompt-key', prepared.prompt.key,
+  ));
+
+  assert.equal(JSON.parse(execute('--run', id)).status, 'waiting');
+  assert.equal(JSON.parse(run('show', '--run', id)).status, 'waiting');
+  run('confirm', '--run', id, '--action', 'publish-result', '--by', 'test-user');
+  const completed = JSON.parse(execute('--run', id));
+  assert.equal(completed.status, 'workflow-segment-complete');
+  assert.equal(completed.executed[0].nodeId, 'publish-result');
+  assert.equal(JSON.parse(run('show', '--run', id)).plan[0].status, 'completed');
+});
+
+test('page switching and coordinate vision actions are batchable cached operations', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `page-actions-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/page-actions-${suffix}.prompt.md`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Switch to a new tab and click a visual widget.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  cache(
+    'recipe-node', '--prompt-key', prepared.prompt.key,
+    '--id', 'switch-and-click', '--title', 'Switch and click',
+  );
+  cache(
+    'page-init', '--prompt-key', prepared.prompt.key,
+    '--page', 'source-page', '--origin', 'https://source.example',
+    '--route', '/*', '--anchor', 'Open target', '--viewport', '1440x900',
+  );
+  cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'source-page', '--name', 'switch-target',
+    '--strategy', 'page', '--target', 'https://target.example/*',
+    '--operation', 'switch-page', '--tab-role', 'resource',
+    '--postcondition', 'Target tab selected',
+  );
+  cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'source-page', '--name', 'visual-widget',
+    '--strategy', 'vision', '--target', '320,240',
+    '--operation', 'click', '--postcondition', 'Widget opened',
+  );
+  cache(
+    'recipe-route', '--prompt-key', prepared.prompt.key,
+    '--node', 'switch-and-click', '--id', 'default',
+    '--action', 'source-page/switch-target',
+    '--action', 'source-page/visual-widget',
+    '--expect-action', 'source-page/switch-target',
+  );
+  id = runId(run(
+    'init', '--summary', 'Test page actions', '--name', 'page-actions',
+    '--prompt-key', prepared.prompt.key,
+  ));
+  const dryRun = JSON.parse(recipe('--run', id, '--node', 'switch-and-click', '--dry-run', 'true'));
+  assert.equal(dryRun.actions[0].target, 'https://target.example/*');
+  assert.equal(dryRun.actions[0].tabRole, 'resource');
+  assert.deepEqual(dryRun.actions[1].point, { x: 320, y: 240 });
 });
 
 test('official Playwright Skill and prompt-first project guidance are present', () => {
   const officialSkill = join(root, '.agents', 'skills', 'playwright-cli', 'SKILL.md');
+  const compilerSkill = join(root, '.agents', 'skills', 'compile-browser-workflows', 'SKILL.md');
   const guidance = readFileSync(join(root, 'AGENTS.md'), 'utf8');
   assert.equal(existsSync(officialSkill), true);
+  assert.equal(existsSync(compilerSkill), true);
   assert.match(guidance, /The prompt is the workflow definition/);
   assert.match(guidance, /Do not require the user to create a Skill, YAML contract/);
-  assert.match(guidance, /Prompt file identity plus its content hash/);
+  assert.match(guidance, /definitions are versioned by Prompt file identity plus content hash/i);
+  assert.match(guidance, /Stable page actions are\s+shared across content versions/);
   assert.match(guidance, /parameterized Workflow Recipe/);
   assert.match(guidance, /workflow commit/);
   assert.match(guidance, /Do not pre-check and post-check every cached click or fill/);
+  assert.match(guidance, /pnpm execute/);
+  assert.match(guidance, /Prompt paragraph order is a soft hint/);
   assert.equal(existsSync(join(root, 'workflows')), false);
   assert.equal(existsSync(join(root, 'skills')), false);
   assert.equal(existsSync(join(root, 'knowledge')), false);

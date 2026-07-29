@@ -5,6 +5,7 @@
 用户不需要新增项目目录、业务 Skill、YAML、selector 或脚本。项目只提供：
 
 - 项目本地的官方 Playwright CLI Skill，负责观察页面和操作浏览器；
+- 项目本地的 Workflow Compiler Skill，负责把不规整的 Prompt 编译成页面事务；
 - `AGENTS.md`，负责通用执行规则、安全边界和人工步骤衔接；
 - 按 Prompt 隔离的流程定义与页面操作缓存；
 - 面向跨 Copilot 会话恢复的通用执行状态。
@@ -35,12 +36,17 @@ pnpm browser install --skills agents
 提交审批前展示汇总并等待我确认。
 ```
 
-Agent 会在首次运行时把 Prompt 学习成参数化流程图；后续把本次变量注入流程，根据已知条件选择缓存分支，并以业务步骤为单位批量操作页面。流程变化时直接修改 Prompt，不需要同步修改业务代码。
+Agent 会在首次运行时读取完整 Prompt，先从最终输出反推所需事实，再按数据依赖和页面
+归属生成参数化流程图。Prompt 中分散描述但来自同一页面的字段会被合并到一次页面事务；
+后续运行由本地执行器连续跑完整个可执行浏览器段。流程变化时直接修改 Prompt，不需要同步
+修改业务代码。
 
 ## 目录职责
 
 ```text
 .agents/skills/playwright-cli/  官方 Playwright CLI Skill
+.agents/skills/compile-browser-workflows/
+                                Prompt 到页面事务的通用编译规则
 .github/prompts/                用户维护的自然语言流程
 .workflow-cache/                Agent 自动学习的 Prompt 专属缓存
 .workflow-runs/                 每次执行的状态与断点
@@ -96,20 +102,31 @@ pnpm run workflow -- context --run <run-id>
 │       └── <prompt-hash>.json        参数化流程节点与条件路线
 └── pages/
     └── <prompt-key>/
-        └── <prompt-hash>/
-            └── <page-id>.json        页面变体、语义动作与 locator 候选
+        └── shared/
+            └── <page-id>.json        跨 Prompt 正文版本复用的页面动作
 ```
 
 - 同一个 Prompt、不同订单或资源变量：共享缓存，run 相互隔离；
 - 不同 Prompt：缓存完全隔离；
-- Prompt 内容改变：自动创建新版本，不复用旧版本；
+- Prompt 内容改变：Workflow Definition 自动创建新版本；
+- 同一 Prompt 文件的稳定页面动作可以跨正文版本复用，不同 Prompt 文件仍完全隔离；
 - 订单号、资源名称等实例变量只进入 run，不作为缓存分支；
 - 订单类型、环境等真正改变步骤的变量用于选择局部路线；
 - 角色、租户、语言和 UI 版本用于选择页面变体；
 - 缓存由 Agent 自动生成和修复，用户只维护自然语言 Prompt；
 - snapshot ref、凭据、验证码和本次业务变量不会写入缓存。
 
-首次执行时，Agent 解析 Prompt、探索页面，并学习业务节点、局部路线和稳定操作：
+首次执行时，Agent 生成一份内部编译输入。业务说明保存在 Workflow、事实、策略、事务和
+操作的 `description` 字段中；Skill 只保存所有业务共用的编译算法。该 JSON 是编译中间产物，
+不需要用户维护：
+
+```bash
+pnpm compile -- --prompt-key <prompt-key> --file <agent-generated-json>
+```
+
+编译器不会机械保留 Prompt 的句子顺序。它保留明确的前后关系、事实依赖、人工边界和高风险
+操作，然后优先排列相同页面状态的任务，并融合兼容事务。之后 Agent 探索页面并学习局部路线
+和稳定操作：
 
 ```bash
 pnpm run cachectl -- list
@@ -148,7 +165,35 @@ pnpm run cachectl -- recipe-resolve --prompt-key <prompt-key> \
 - `needs-learning`：首次遇到新类型，只探索这个节点；
 - `ambiguous`：路线规则冲突，需要 Agent 修复定义。
 
-缓存命中后，一个业务节点由一条命令完成：
+缓存命中后，正常路径使用一条命令连续执行多个页面事务：
+
+```bash
+pnpm execute -- --run <run-id>
+```
+
+执行器在进程内持续运行和提交断点，仅在人工/未确认风险边界、缺少路由事实、Cache
+失配或浏览器段结束时返回 Agent。缓存决策和报告节点会在本地完成；新标签页按照 URL 和
+tab role 在同一浏览器 Session 中切换。某个事务失败后，失败状态会先写入 Run，再返回 Agent，
+只修复该事务并从失败点恢复：
+
+```bash
+pnpm execute -- --run <run-id> --from <failed-node-id>
+```
+
+清理 Cache 时先预览准确目标：
+
+```bash
+# 只清当前 Prompt 正文版本的 Definition
+pnpm cachectl clear --prompt-key <prompt-key> --scope current
+
+# 清理该 Prompt 文件的所有 Definition 版本和共享页面 Cache
+pnpm cachectl clear --prompt-key <prompt-key> --scope workflow
+
+# 确认预览无误后执行
+pnpm cachectl clear --prompt-key <prompt-key> --scope workflow --apply true
+```
+
+单节点命令保留用于学习、测试和修复：
 
 ```bash
 pnpm run recipe -- --run <run-id> --node process-order

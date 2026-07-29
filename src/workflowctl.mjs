@@ -7,12 +7,14 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import {
   cacheDisplayPaths,
   ensurePromptCache,
+  normalizeDefinition,
   resolvePromptSelection,
 } from './cache-store.mjs';
 
 const ROOT = resolve(process.cwd());
 const RUNS_DIR = join(ROOT, '.workflow-runs');
 const STEP_STATUSES = new Set(['pending', 'in_progress', 'completed', 'skipped', 'blocked']);
+const RUN_STATUSES = new Set(['active', 'waiting', 'repair_required', 'completed']);
 
 function usage(exitCode = 0) {
   console.log(`
@@ -256,7 +258,36 @@ function authorizationsForDisplay(authorizations) {
   ]));
 }
 
-function contextText(run, title = 'Workflow resume context') {
+function compiledWorkflowText(compiled) {
+  if (!compiled) return 'N/A';
+  return toMarkdown({
+    workflow: compiled.workflow,
+    inputs: compiled.inputs,
+    facts: compiled.facts,
+    outputs: compiled.outputs,
+    policies: compiled.policies,
+    nextTransactions: compiled.nodes?.map((node) => ({
+      id: node.id,
+      title: node.title,
+      description: node.description,
+      type: node.type,
+      requires: node.requires,
+      produces: node.produces,
+      barrier: node.barrier,
+    })),
+  });
+}
+
+async function compiledWorkflowForRun(run) {
+  const definitionFile = run.prompt?.cache?.definition;
+  if (!definitionFile) return null;
+  const absolute = resolve(ROOT, definitionFile);
+  const pathFromRoot = relative(ROOT, absolute);
+  if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot) || !existsSync(absolute)) return null;
+  return normalizeDefinition(JSON.parse(await readFile(absolute, 'utf8'))).compiled;
+}
+
+function contextText(run, title = 'Workflow resume context', compiled = null) {
   const waiting = run.waiting
     ? `- Reason: ${run.waiting.reason}\n- Until: ${run.waiting.until || 'N/A'}\n- Since: ${run.waiting.at}`
     : 'N/A';
@@ -290,6 +321,10 @@ ${decisionsMarkdown(run.decisions)}
 ## Recipe
 
 ${toMarkdown(run.recipe)}
+
+## Compiled workflow
+
+${compiledWorkflowText(compiled)}
 
 ## Cursor
 
@@ -403,7 +438,7 @@ async function main() {
   }
 
   if (command === 'context') {
-    console.log(contextText(run));
+    console.log(contextText(run, 'Workflow resume context', await compiledWorkflowForRun(run)));
     return;
   }
 
@@ -523,8 +558,10 @@ async function main() {
   }
 
   if (command === 'resume') {
-    if (run.status !== 'waiting') throw new Error('Run is not waiting');
-    run.waitHistory.push({ ...run.waiting, resumedAt: new Date().toISOString() });
+    if (!['waiting', 'repair_required'].includes(run.status)) {
+      throw new Error('Run is not waiting or repair_required');
+    }
+    if (run.waiting) run.waitHistory.push({ ...run.waiting, resumedAt: new Date().toISOString() });
     run.status = 'active';
     run.waiting = null;
     await saveRun(run);
@@ -655,6 +692,7 @@ async function main() {
     if (payload.telemetry) {
       const event = {
         at,
+        kind: payload.telemetry.kind ?? 'transaction',
         batchId: payload.telemetry.batchId ?? '',
         nodeId: payload.telemetry.nodeId ?? '',
         routeId: payload.telemetry.routeId ?? '',
@@ -675,13 +713,20 @@ async function main() {
       await appendFile(join(runDir(runId), 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8');
     }
 
+    if (payload.runStatus !== undefined) {
+      if (!RUN_STATUSES.has(payload.runStatus)) {
+        throw new Error(`Invalid runStatus: ${payload.runStatus}`);
+      }
+      run.status = payload.runStatus;
+    }
+
     await saveRun(run);
     console.log(`Workflow boundary committed: ${steps.map((step) => step.id).join(', ') || 'state-only'}`);
     return;
   }
 
   if (command === 'review') {
-    const output = contextText(run, 'Workflow review');
+    const output = contextText(run, 'Workflow review', await compiledWorkflowForRun(run));
     await writeFile(join(runDir(runId), 'review.md'), output, 'utf8');
     console.log(output);
     return;
