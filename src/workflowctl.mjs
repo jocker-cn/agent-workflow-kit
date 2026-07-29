@@ -25,6 +25,7 @@ Commands:
        [--prompt-file <path> | --prompt-key <key>]
        [--workflow-name <name>] [--input key=value]...
   show --run <run-id>
+  status --run <run-id>
   latest [--workflow-name <name>] [--input key=value]...
   context --run <run-id>
   plan-add --run <run-id> --id <step-id> --title <text> [--after <step-id>]
@@ -57,6 +58,10 @@ function args(argv) {
     const token = rest[index];
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`);
     const key = token.slice(2);
+    if (key === 'help') {
+      flags.help = ['true'];
+      continue;
+    }
     const value = rest[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for --${key}`);
     (flags[key] ??= []).push(value);
@@ -358,7 +363,7 @@ ${toMarkdown(run.executionHistory.slice(-10))}
 
 async function main() {
   const { command, flags } = args(process.argv.slice(2));
-  if (!command || command === 'help' || command === '--help') usage();
+  if (!command || command === 'help' || command === '--help' || flags.help) usage();
 
   if (command === 'init') {
     const name = safeName(
@@ -434,6 +439,21 @@ async function main() {
 
   if (command === 'show') {
     console.log(JSON.stringify(run, null, 2));
+    return;
+  }
+
+  if (command === 'status') {
+    console.log(JSON.stringify({
+      runId: run.runId,
+      name: run.name,
+      status: run.status,
+      currentStep: run.cursor.currentStep,
+      nextAction: run.cursor.nextAction,
+      waiting: run.waiting,
+      completedSteps: run.plan.filter((step) => ['completed', 'skipped'].includes(step.status)).length,
+      totalSteps: run.plan.length,
+      updatedAt: run.updatedAt,
+    }, null, 2));
     return;
   }
 
@@ -699,11 +719,15 @@ async function main() {
         startedAt: payload.telemetry.startedAt ?? '',
         endedAt: payload.telemetry.endedAt ?? at,
         durationMs: Number(payload.telemetry.durationMs ?? 0),
+        workflowDurationMs: Number(payload.telemetry.workflowDurationMs ?? 0),
         orchestrationGapMs: Number(payload.telemetry.orchestrationGapMs ?? 0),
         status: payload.telemetry.status ?? 'success',
       };
       if (!Number.isFinite(event.durationMs) || event.durationMs < 0) {
         throw new Error('telemetry.durationMs must be a non-negative number');
+      }
+      if (!Number.isFinite(event.workflowDurationMs) || event.workflowDurationMs < 0) {
+        throw new Error('telemetry.workflowDurationMs must be a non-negative number');
       }
       if (!Number.isFinite(event.orchestrationGapMs) || event.orchestrationGapMs < 0) {
         throw new Error('telemetry.orchestrationGapMs must be a non-negative number');

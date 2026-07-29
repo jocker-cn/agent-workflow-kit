@@ -42,6 +42,10 @@ function parseArgs(argv) {
     const token = argv[index];
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`);
     const key = token.slice(2);
+    if (key === 'help') {
+      flags.help = ['true'];
+      continue;
+    }
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for --${key}`);
     (flags[key] ??= []).push(value);
@@ -137,17 +141,24 @@ function healthyCandidate(action) {
     })[0];
 }
 
-function selectorCode(selector) {
+function selectorCode(selector, action = {}, values = {}) {
   const value = JSON.stringify(selector.value);
-  if (selector.kind === 'css') return `__page.locator(${value})`;
+  let locator;
+  if (selector.kind === 'css') locator = `__page.locator(${value})`;
   if (selector.kind === 'role') {
-    return `__page.getByRole(${JSON.stringify(selector.role)}, { name: ${value}, exact: true })`;
+    locator = `__page.getByRole(${JSON.stringify(selector.role)}, { name: ${value}, exact: true })`;
   }
-  if (selector.kind === 'text') return `__page.getByText(${value}, { exact: false })`;
-  if (selector.kind === 'label') return `__page.getByLabel(${value}, { exact: true })`;
-  if (selector.kind === 'placeholder') return `__page.getByPlaceholder(${value}, { exact: true })`;
-  if (selector.kind === 'testid') return `__page.getByTestId(${value})`;
-  throw new Error(`Unsupported selector kind: ${selector.kind}`);
+  if (selector.kind === 'text') locator = `__page.getByText(${value}, { exact: false })`;
+  if (selector.kind === 'label') locator = `__page.getByLabel(${value}, { exact: true })`;
+  if (selector.kind === 'placeholder') locator = `__page.getByPlaceholder(${value}, { exact: true })`;
+  if (selector.kind === 'testid') locator = `__page.getByTestId(${value})`;
+  if (!locator) throw new Error(`Unsupported selector kind: ${selector.kind}`);
+  if (action.hasTextFrom) {
+    locator += `.filter({ hasText: ${runtimeValueCode(action.hasTextFrom, values)} })`;
+  }
+  if (action.nth !== null && action.nth !== undefined) locator += `.nth(${action.nth})`;
+  else if (action.matchMode === 'first') locator += '.first()';
+  return locator;
 }
 
 function runtimeValueCode(valueFrom, values) {
@@ -170,23 +181,60 @@ function operationCode(action, locator, values, candidate) {
   if (candidate.strategy === 'vision' && action.operation === 'click') {
     return `await __page.mouse.click(${candidate.point.x}, ${candidate.point.y})`;
   }
-  if (action.operation === 'click') return `await ${locator}.click()`;
-  if (action.operation === 'fill') return `await ${locator}.fill(${runtimeValueCode(action.valueFrom, values)})`;
-  if (action.operation === 'select') {
-    return `await ${locator}.selectOption(${runtimeValueCode(action.valueFrom, values)})`;
+  const all = action.matchMode === 'all';
+  if (action.operation === 'click') {
+    return all
+      ? `for (const __item of await ${locator}.all()) await __item.click()`
+      : `await ${locator}.click()`;
   }
-  if (action.operation === 'check') return `await ${locator}.check()`;
-  if (action.operation === 'uncheck') return `await ${locator}.uncheck()`;
+  if (action.operation === 'fill') {
+    const value = runtimeValueCode(action.valueFrom, values);
+    return all
+      ? `for (const __item of await ${locator}.all()) await __item.fill(${value})`
+      : `await ${locator}.fill(${value})`;
+  }
+  if (action.operation === 'select') {
+    const value = runtimeValueCode(action.valueFrom, values);
+    return all
+      ? `for (const __item of await ${locator}.all()) await __item.selectOption(${value})`
+      : `await ${locator}.selectOption(${value})`;
+  }
+  if (action.operation === 'check') {
+    return all
+      ? `for (const __item of await ${locator}.all()) await __item.check()`
+      : `await ${locator}.check()`;
+  }
+  if (action.operation === 'uncheck') {
+    return all
+      ? `for (const __item of await ${locator}.all()) await __item.uncheck()`
+      : `await ${locator}.uncheck()`;
+  }
+  if (action.operation === 'wait') {
+    const timeoutMs = Number(action.timeoutMs ?? 10000);
+    if (action.waitFor === 'stable') {
+      const stableMs = Number(action.stableMs ?? 300);
+      return `await __waitStable(${locator}, ${timeoutMs}, ${stableMs})`;
+    }
+    return `await ${locator}.waitFor({ state: ${JSON.stringify(action.waitFor ?? 'visible')}, timeout: ${timeoutMs} })`;
+  }
   if (action.operation === 'extract' && action.extractAttribute) {
+    if (all) {
+      return `__extracted[${JSON.stringify(action.extractTo)}] = await Promise.all((await ${locator}.all()).map(async __item => (await __item.getAttribute(${JSON.stringify(action.extractAttribute)}))?.trim() ?? ''))`;
+    }
     return `__extracted[${JSON.stringify(action.extractTo)}] = (await ${locator}.getAttribute(${JSON.stringify(action.extractAttribute)}))?.trim() ?? ''`;
   }
-  if (action.operation === 'extract') return `__extracted[${JSON.stringify(action.extractTo)}] = (await ${locator}.textContent())?.trim() ?? ''`;
+  if (action.operation === 'extract') {
+    return all
+      ? `__extracted[${JSON.stringify(action.extractTo)}] = (await ${locator}.allTextContents()).map(value => value.trim())`
+      : `__extracted[${JSON.stringify(action.extractTo)}] = (await ${locator}.textContent())?.trim() ?? ''`;
+  }
   throw new Error(`Unsupported operation: ${action.operation}`);
 }
 
-function fingerprintValue(pageId, variantId, fingerprint) {
+function fingerprintValue(pageId, variantId, fingerprint, tabRole = '') {
   return {
     id: `${pageId}@${variantId}`,
+    tabRole,
     origin: fingerprint.origin ?? '',
     route: fingerprint.route ?? '',
     title: fingerprint.title ?? '',
@@ -212,7 +260,7 @@ function expectationCode(expectation, actionLookup) {
     if (!selected.candidate.selector) {
       throw new Error(`Expectation action requires a locator or page candidate: ${key}`);
     }
-    return `await ${selectorCode(selected.candidate.selector)}.waitFor({ state: 'visible' })`;
+    return `await ${selectorCode(selected.candidate.selector, selected.action, actionLookup.values ?? {})}.waitFor({ state: 'visible' })`;
   }
   throw new Error(`Unsupported expectation kind: ${expectation.kind}`);
 }
@@ -259,6 +307,7 @@ async function main() {
 
   const loadedPages = new Map();
   const actionLookup = new Map();
+  actionLookup.values = values;
   const selectedActions = [];
   for (const reference of selectedRoute.actions) {
     let loaded = loadedPages.get(reference.page);
@@ -299,7 +348,12 @@ async function main() {
     if (!group || group.key !== key) {
       group = {
         key,
-        fingerprint: fingerprintValue(selected.reference.page, variantId, selected.variant.fingerprint),
+        fingerprint: fingerprintValue(
+          selected.reference.page,
+          variantId,
+          selected.variant.fingerprint,
+          actionGroups.length === 0 ? selectedRoute.affinity?.tab ?? '' : '',
+        ),
         actions: [],
       };
       actionGroups.push(group);
@@ -333,21 +387,39 @@ async function main() {
     '    } while (Date.now() <= deadline);',
     '    throw new Error(`page-switch:${urlGlob}:available=${__page.context().pages().map(item => item.url()).join("|")}`);',
     '  };',
-    '  const __matchesPage = async expected => {',
-    '    const currentUrl = __page.url();',
+    '  const __waitStable = async (locator, timeoutMs, stableMs) => {',
+    '    const deadline = Date.now() + timeoutMs;',
+    '    let last = null;',
+    '    let stableSince = 0;',
+    '    do {',
+    '      const current = await locator.allTextContents().catch(() => []);',
+    '      const serialized = JSON.stringify(current);',
+    '      if (current.length > 0 && serialized === last) {',
+    '        if (!stableSince) stableSince = Date.now();',
+    '        if (Date.now() - stableSince >= stableMs) return;',
+    '      } else {',
+    '        last = serialized;',
+    '        stableSince = Date.now();',
+    '      }',
+    '      await __page.waitForTimeout(100);',
+    '    } while (Date.now() <= deadline);',
+    '    throw new Error(`locator-stability-timeout:${timeoutMs}`);',
+    '  };',
+    '  const __matchesPage = async (expected, candidate = __page) => {',
+    '    const currentUrl = candidate.url();',
     '    if (expected.origin && currentUrl !== expected.origin && !currentUrl.startsWith(`${expected.origin}/`)) return false;',
     '    if (expected.route) {',
     '      const pattern = __globRegex(expected.route);',
     '      const routeTarget = expected.route.includes("://") ? currentUrl : currentUrl.slice(expected.origin.length);',
     '      if (!pattern.test(routeTarget)) return false;',
     '    }',
-    '    if (expected.title && !(await __page.title()).includes(expected.title)) return false;',
+    '    if (expected.title && !(await candidate.title()).includes(expected.title)) return false;',
     '    if (expected.viewport) {',
-    '      const viewport = __page.viewportSize();',
+    '      const viewport = candidate.viewportSize();',
     '      if (!viewport || `${viewport.width}x${viewport.height}` !== expected.viewport) return false;',
     '    }',
     '    for (const anchor of expected.anchors) {',
-    '      if (!await __page.getByText(anchor, { exact: false }).first().isVisible().catch(() => false)) return false;',
+    '      if (!await candidate.getByText(anchor, { exact: false }).first().isVisible().catch(() => false)) return false;',
     '    }',
     '    return true;',
     '  };',
@@ -362,8 +434,19 @@ async function main() {
     '  const __findCurrentGroup = async timeoutMs => {',
     '    const deadline = Date.now() + timeoutMs;',
     '    do {',
+    '      let matched = null;',
     '      for (let index = 0; index < __groups.length; index += 1) {',
-    '        if (await __matchesPage(__groups[index])) return index;',
+    '        for (const candidate of __page.context().pages()) {',
+    '          if (await __matchesPage(__groups[index], candidate)) {',
+    '            matched = { index, candidate };',
+    '          }',
+    '        }',
+    '      }',
+    '      if (matched) {',
+    '        __page = matched.candidate;',
+    '        if (__groups[matched.index].tabRole) __tabs.set(__groups[matched.index].tabRole, matched.candidate);',
+    '        await matched.candidate.bringToFront();',
+    '        return matched.index;',
     '      }',
     '      await __page.waitForTimeout(100);',
     '    } while (Date.now() <= deadline);',
@@ -377,7 +460,9 @@ async function main() {
     lines.push(`    if (__startGroup <= ${groupIndex}) {`);
     lines.push(`      await __waitForPage(__groups[${groupIndex}], __transitionTimeoutMs);`);
     for (const selected of group.actions) {
-      const locator = selected.candidate.selector ? selectorCode(selected.candidate.selector) : null;
+      const locator = selected.candidate.selector
+        ? selectorCode(selected.candidate.selector, selected.action, values)
+        : null;
       lines.push('      {');
       lines.push('        const __startedAt = new Date().toISOString();');
       lines.push('        const __started = Date.now();');
@@ -428,6 +513,10 @@ async function main() {
         point: candidate.point ?? null,
         target: candidate.strategy === 'page' ? candidate.target : undefined,
         tabRole: action.tabRole || undefined,
+        hasTextFrom: action.hasTextFrom || undefined,
+        matchMode: action.matchMode || 'strict',
+        nth: action.nth ?? undefined,
+        waitFor: action.operation === 'wait' ? action.waitFor : undefined,
       })),
       expectation: selectedRoute.expectation,
     }, null, 2));
@@ -508,7 +597,12 @@ async function main() {
         ? `Cached route ${selectedRoute.routeId} completed`
         : `Cached route ${selectedRoute.routeId} failed: ${result.reason}`,
     },
-    facts: Object.entries(result.extracted ?? {}).map(([key, value]) => ({
+    facts: Object.entries({
+      ...(result.extracted ?? {}),
+      ...(result.status === 'success'
+        ? Object.fromEntries((selectedRoute.asserts ?? []).map(({ key, value }) => [key, value]))
+        : {}),
+    }).map(([key, value]) => ({
       key,
       value,
       source: `Cached browser route ${nodeId}/${selectedRoute.routeId}`,

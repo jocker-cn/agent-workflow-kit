@@ -26,6 +26,8 @@ configuration file, selector map, or project-specific script before starting.
 - Group compatible work by system, page kind, material page state, tab role, and variant. If the
   Prompt mentions fields from the same stable page in different places, collect their union during
   one page transaction.
+- Classify every produced value as exactly one of: page `collects`, boundary `asserts`, or local
+  `computes`. Never manually add a fact that the compiled transaction declares as produced.
 - Store workflow-specific explanatory text in the compiled Workflow fields (`description`,
   facts, policies, transaction operations). Do not put business descriptions into this file or a
   reusable Skill.
@@ -46,6 +48,9 @@ configuration file, selector map, or project-specific script before starting.
   individual clicks or Prompt sentences as plan steps.
 - Save state once per meaningful business boundary with `pnpm run workflow -- commit --file <json>`. One commit may contain step updates, facts, decisions, outputs, evidence, the recovery cursor, selected recipe routes, and timing. Do not issue a separate process for every fact or output.
 - When an observed fact selects a conditional route, resolve it deterministically from the cached route guards. Ask the model to plan only when a route is unknown or ambiguous.
+- A decision or report transaction must calculate and commit its declared facts and outputs before
+  it is marked complete. Do not replace deterministic local computation with separate `fact`,
+  `decision`, `output`, or `complete` commands.
 - Save a boundary before a long wait or risky action. It must identify the current step, next action, current Web system, and last useful URL.
 - Never copy inputs, facts, decisions, or outputs from another run unless the current prompt explicitly requires it.
 - When recovering without conversation context, select the run by its business inputs. Do not assume the most recently updated run is the intended one when multiple runs could match.
@@ -73,9 +78,19 @@ configuration file, selector map, or project-specific script before starting.
 - Use `pnpm run recipe -- --run <run-id> --node <node-id>` only to learn, test, repair, or resume a
   single failed transaction.
 - The Recipe Runner waits for the next cached page fingerprint after SPA navigation. On retry it detects the current matching page group and resumes there, skipping earlier navigation groups. Do not manually force the browser back to a route's first page when a later cached page already matches.
+- After a same-URL action that refreshes asynchronous content, cache a structured `wait` action
+  before extracting or clicking results. Free-text `postcondition` is documentation, not an
+  executable wait.
+- Parameterize repeated result locators with the current run input or fact (`hasTextFrom`) and an
+  explicit cardinality (`strict`, `first`, or `nth`). Do not cache a broad row locator whose meaning
+  depends on result ordering.
 - When an action opens a new tab, learn a `page/switch-page` action with a stable URL glob and tab
   role. The Runner selects it from the existing browser context and subsequent page groups continue
   on that tab without returning to the model.
+- At transaction entry, rely on the transaction affinity and cached page fingerprint to identify
+  the correct page across all open tabs. Do not prepend a source-page switch workaround merely
+  because a previous executor invocation focused another tab. Collect all required source-page
+  fields before an action that leaves or switches that page.
 - After a successful recipe node, commit its generated `.workflow-runs/<run-id>/last-boundary.json` with one `workflow commit`. Do not call `page-show`, `action-result`, `fact`, `decision`, or `output` separately for every action or field on a successful fast path. Use `action-result-batch` only when browser work could not run through the recipe runner.
 - Prefer cached user-facing Playwright locators. Use a scoped CSS locator when the page lacks usable
   semantics. A non-semantic custom widget may use a cached `x,y` vision click only when the viewport

@@ -43,6 +43,10 @@ function parseArgs(argv) {
     const token = argv[index];
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`);
     const key = token.slice(2);
+    if (key === 'help') {
+      flags.help = ['true'];
+      continue;
+    }
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for --${key}`);
     (flags[key] ??= []).push(value);
@@ -95,6 +99,89 @@ function mergeDeep(target, source) {
     }
   }
   return target;
+}
+
+function nestedValue(values, dottedKey) {
+  return dottedKey.split('.').reduce((current, part) => current?.[part], values);
+}
+
+function localizedNumber(value) {
+  if (typeof value === 'number') return value;
+  const normalized = String(value ?? '').replaceAll(',', '').trim();
+  const match = normalized.match(/-?\d+(?:\.\d+)?/);
+  if (!match) throw new Error(`Cannot parse number from: ${value}`);
+  const multiplier = /万/.test(normalized) ? 10000 : /亿/.test(normalized) ? 100000000 : 1;
+  return Number(match[0]) * multiplier;
+}
+
+function localizedRange(value) {
+  const parts = String(value ?? '').split(/\s*(?:-|–|—|~|至)\s*/).filter(Boolean);
+  if (parts.length !== 2) throw new Error(`Cannot parse range from: ${value}`);
+  return { min: localizedNumber(parts[0]), max: localizedNumber(parts[1]) };
+}
+
+function computationSource(computation, values, key = 'from') {
+  if (computation[key] !== undefined) return nestedValue(values, computation[key]);
+  if (computation.value !== undefined) return computation.value;
+  throw new Error(`Computation ${computation.key} requires ${key} or value`);
+}
+
+function evaluateComputation(computation, values) {
+  switch (computation.op) {
+    case 'copy':
+      return computationSource(computation, values);
+    case 'set':
+      return computation.value;
+    case 'parse-number':
+      return localizedNumber(computationSource(computation, values));
+    case 'parse-range':
+      return localizedRange(computationSource(computation, values));
+    case 'equals':
+      return computationSource(computation, values) === computationSource(computation, values, 'otherFrom');
+    case 'contains':
+      return String(computationSource(computation, values))
+        .includes(String(computationSource(computation, values, 'otherFrom')));
+    case 'between': {
+      const value = localizedNumber(computationSource(computation, values));
+      const range = computation.rangeFrom
+        ? nestedValue(values, computation.rangeFrom)
+        : computation.range;
+      if (!range || range.min === undefined || range.max === undefined) {
+        throw new Error(`Computation ${computation.key} requires rangeFrom or range`);
+      }
+      return value >= localizedNumber(range.min) && value <= localizedNumber(range.max);
+    }
+    case 'conditional':
+      return nestedValue(values, computation.when)
+        ? computation.trueValue
+        : computation.falseValue;
+    case 'template':
+      return String(computation.template ?? '').replace(/\$\{([^}]+)\}/g, (_, key) => {
+        const value = nestedValue(values, key.replace(/^(?:fact|input|output):/, ''));
+        if (value === undefined) throw new Error(`Template value is missing: ${key}`);
+        return typeof value === 'object' ? JSON.stringify(value) : String(value);
+      });
+    default:
+      throw new Error(`Unsupported local computation: ${computation.op}`);
+  }
+}
+
+function localComputationPayload(node, run, explicitValues) {
+  const values = transactionValues(run, explicitValues);
+  const facts = [];
+  const outputs = [];
+  for (const computation of node.computes ?? []) {
+    const value = evaluateComputation(computation, values);
+    setPath(values, computation.key, value);
+    const item = {
+      key: computation.key,
+      value,
+      source: `Local ${node.type} computation ${node.id}/${computation.op}`,
+    };
+    if (computation.target === 'output') outputs.push({ key: item.key, value: item.value });
+    else facts.push(item);
+  }
+  return { facts, outputs, values };
 }
 
 async function loadRun(runId) {
@@ -350,6 +437,9 @@ async function main() {
 
     if (node.type === 'decision' || node.type === 'report') {
       const payload = localBoundary(node, selectedRoute);
+      const computed = localComputationPayload(node, run, explicitValues);
+      payload.facts = computed.facts;
+      payload.outputs = computed.outputs;
       if (node.type === 'decision') {
         payload.decisions = [{
           name: node.id,
@@ -357,6 +447,24 @@ async function main() {
           selected: selectedRoute.routeId,
           reason: `Resolved locally from cached guard ${selectedRoute.routeSignature}`,
         }];
+      }
+      const producedValues = mergeDeep(
+        mergeDeep({}, computed.values),
+        Object.fromEntries(computed.outputs.map(({ key, value }) => [key, value])),
+      );
+      const missingProduced = (node.produces ?? [])
+        .filter((key) => nestedValue(producedValues, key) === undefined);
+      if (missingProduced.length > 0) {
+        throw new Error(`Local node ${node.id} did not produce declared values: ${missingProduced.join(', ')}`);
+      }
+      if (node.type === 'report') {
+        const missingOutputs = (definition.compiled.outputs ?? [])
+          .map((output) => typeof output === 'string' ? output : output.key)
+          .filter(Boolean)
+          .filter((key) => nestedValue(producedValues, key) === undefined);
+        if (missingOutputs.length > 0) {
+          throw new Error(`Report ${node.id} did not produce workflow outputs: ${missingOutputs.join(', ')}`);
+        }
       }
       payload.recipe.version = definition.compiled.version;
       payload.runStatus = 'active';
@@ -448,6 +556,11 @@ async function main() {
   }
 
   if (!dryRun) {
+    const completedAt = Date.now();
+    const workflowDurationMs = Math.max(
+      0,
+      completedAt - Date.parse(initialRun.createdAt ?? segmentStartedAt),
+    );
     await writeAndCommit(runId, {
       runStatus: 'active',
       telemetry: {
@@ -456,16 +569,22 @@ async function main() {
         startedAt: segmentStartedAt,
         endedAt: new Date().toISOString(),
         durationMs: Date.now() - segmentStarted,
+        workflowDurationMs,
         status: 'success',
       },
     });
   }
+  const workflowDurationMs = Math.max(
+    0,
+    Date.now() - Date.parse(initialRun.createdAt ?? segmentStartedAt),
+  );
   console.log(JSON.stringify({
     status: dryRun ? 'ready' : 'workflow-segment-complete',
     runId,
     executed,
     skipped,
     durationMs: Date.now() - segmentStarted,
+    workflowDurationMs,
     next: executed.length >= maxNodes ? 'max-nodes-reached' : 'end-of-recipe',
   }, null, 2));
 }

@@ -497,6 +497,7 @@ test('workflow compiler reorders scattered prompt work by dependencies and fuses
         },
         requires: ['session.authenticated'],
         produces: ['search.exists'],
+        asserts: [{ key: 'search.exists', value: true }],
         operations: [{ id: 'apply-filter', description: 'Apply the search filter' }],
       },
       {
@@ -537,6 +538,7 @@ test('workflow compiler reorders scattered prompt work by dependencies and fuses
     'search.referenceFollowers',
     'search.videoUrl',
   ]);
+  assert.deepEqual(compiled.nodes[0].asserts, [{ key: 'search.exists', value: true, description: '' }]);
   assert.equal(compiled.nodes[1].id, 'verify-bilibili');
   assert.equal(compiled.nodes[0].description.includes('reference range'), true);
 });
@@ -752,6 +754,7 @@ test('continuous runner persists human boundaries then completes decision and re
       summary: 'Human and local nodes',
       description: 'Descriptions must be available when a new Agent resumes the run',
     },
+    outputs: [{ key: 'result.summary', description: 'Locally rendered result' }],
     transactions: [
       {
         id: 'human-check',
@@ -774,6 +777,12 @@ test('continuous runner persists human boundaries then completes decision and re
         description: 'Render the result from saved facts',
         type: 'report',
         after: ['choose-route'],
+        computes: [{
+          key: 'result.summary',
+          target: 'output',
+          op: 'template',
+          template: 'Route ${result.route} completed',
+        }],
         routes: [defaultRoute],
       },
     ],
@@ -781,7 +790,7 @@ test('continuous runner persists human boundaries then completes decision and re
   compile('--prompt-key', prepared.prompt.key, '--file', relativeCompiler);
   id = runId(run(
     'init', '--summary', 'Test local runner', '--name', 'local-runner',
-    '--prompt-key', prepared.prompt.key,
+    '--prompt-key', prepared.prompt.key, '--input', 'result.route=default',
   ));
 
   const waiting = JSON.parse(execute('--run', id));
@@ -798,6 +807,7 @@ test('continuous runner persists human boundaries then completes decision and re
   assert.equal(state.status, 'active');
   assert.equal(state.plan.every((step) => step.status === 'completed'), true);
   assert.equal(state.decisions.at(-1).selected, 'default');
+  assert.equal(state.data.result.summary, 'Route default completed');
   assert.equal(state.executionHistory.at(-1).kind, 'segment');
   assert.match(run('context', '--run', id), /Descriptions must be available/);
 });
@@ -976,20 +986,33 @@ test('page switching and coordinate vision actions are batchable cached operatio
     '--operation', 'click', '--postcondition', 'Widget opened',
   );
   cache(
+    'action-learn', '--prompt-key', prepared.prompt.key,
+    '--page', 'source-page', '--name', 'wait-for-target-row',
+    '--strategy', 'css', '--target', 'tbody tr',
+    '--operation', 'wait', '--wait-for', 'stable', '--stable-ms', '250',
+    '--timeout-ms', '5000', '--has-text-from', 'resource.name',
+    '--match-mode', 'first', '--postcondition', 'Requested row is stable',
+  );
+  cache(
     'recipe-route', '--prompt-key', prepared.prompt.key,
     '--node', 'switch-and-click', '--id', 'default',
     '--action', 'source-page/switch-target',
     '--action', 'source-page/visual-widget',
+    '--action', 'source-page/wait-for-target-row',
     '--expect-action', 'source-page/switch-target',
   );
   id = runId(run(
     'init', '--summary', 'Test page actions', '--name', 'page-actions',
-    '--prompt-key', prepared.prompt.key,
+    '--prompt-key', prepared.prompt.key, '--input', 'resource.name=example',
   ));
   const dryRun = JSON.parse(recipe('--run', id, '--node', 'switch-and-click', '--dry-run', 'true'));
   assert.equal(dryRun.actions[0].target, 'https://target.example/*');
   assert.equal(dryRun.actions[0].tabRole, 'resource');
   assert.deepEqual(dryRun.actions[1].point, { x: 320, y: 240 });
+  assert.equal(dryRun.actions[2].operation, 'wait');
+  assert.equal(dryRun.actions[2].hasTextFrom, 'resource.name');
+  assert.equal(dryRun.actions[2].matchMode, 'first');
+  assert.equal(dryRun.actions[2].waitFor, 'stable');
 });
 
 test('official Playwright Skill and prompt-first project guidance are present', () => {

@@ -29,6 +29,7 @@ const ACTION_OPERATIONS = new Set([
   'uncheck',
   'extract',
   'switch-page',
+  'wait',
 ]);
 const LOCATOR_KINDS = new Set(['role', 'text', 'label', 'placeholder', 'testid']);
 const NODE_TYPES = new Set(['browser', 'decision', 'human', 'report']);
@@ -41,6 +42,7 @@ Prompt-scoped workflow cache CLI
 Commands:
   list
   prepare [--prompt <file> | --prompt-key <key>]
+  status [--prompt <file> | --prompt-key <key>]
   show [--prompt <file> | --prompt-key <key>]
   recipe-show [prompt selection]
   recipe-node [prompt selection] --id <node-id> --title <text>
@@ -65,6 +67,10 @@ Commands:
                [--locator-kind <role|text|label|placeholder|testid>] [--role <aria-role>]
                [--value-from <input-or-fact-key>] [--extract-to <fact-key>]
                [--extract-attribute <attribute-name>] [--tab-role <role-name>]
+               [--has-text-from <input-or-fact-key>] [--match-mode <strict|first|all>]
+               [--nth <zero-based-index>]
+               [--wait-for <visible|hidden|attached|detached|stable>]
+               [--timeout-ms <milliseconds>] [--stable-ms <milliseconds>]
   action-result [prompt selection] --page <page-id> --name <action-name>
                 --candidate <candidate-id> --status <success|failure>
                 [--variant <variant-id>] [--reason <text>] [timing fields]
@@ -96,6 +102,10 @@ function parseArgs(argv) {
     const token = rest[index];
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`);
     const key = token.slice(2);
+    if (key === 'help') {
+      flags.help = ['true'];
+      continue;
+    }
     const value = rest[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for --${key}`);
     (flags[key] ??= []).push(value);
@@ -160,7 +170,7 @@ function expandAssignments(assignments) {
 }
 
 function bumpRecipe(definition) {
-  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 3);
+  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 4);
   definition.compiled.version += 1;
   definition.updatedAt = new Date().toISOString();
 }
@@ -239,7 +249,7 @@ function compilationStatus(definition) {
   const normalized = normalizeDefinition(definition);
   if (normalized.compiled.nodes.length === 0) return 'uncompiled';
   if (
-    normalized.schemaVersion < 3
+    normalized.schemaVersion < 4
     || normalized.compiled.nodes.some((node) => !node.description || !node.affinity)
   ) {
     return 'needs-recompile';
@@ -249,7 +259,7 @@ function compilationStatus(definition) {
 
 async function main() {
   const { command, flags } = parseArgs(process.argv.slice(2));
-  if (!command || command === 'help' || command === '--help') usage();
+  if (!command || command === 'help' || command === '--help' || flags.help) usage();
 
   if (command === 'list') {
     console.log(JSON.stringify(await listPromptIdentities(), null, 2));
@@ -298,7 +308,7 @@ async function main() {
 
   const { identity, paths } = await loadScope(flags);
 
-  if (command === 'prepare') {
+  if (command === 'prepare' || command === 'status') {
     const definition = await readJson(paths.definitionPath);
     console.log(JSON.stringify({
       prompt: identity,
@@ -539,6 +549,10 @@ async function main() {
     if (operation === 'extract' && !one(flags, 'extract-to', false)) {
       throw new Error('extract actions require --extract-to');
     }
+    const waitFor = one(flags, 'wait-for', false) ?? 'visible';
+    if (operation === 'wait' && !['visible', 'hidden', 'attached', 'detached', 'stable'].includes(waitFor)) {
+      throw new Error('--wait-for must be visible, hidden, attached, detached, or stable');
+    }
     if (strategy === 'vision' && (operation !== 'click' || !/^\d+,\d+$/.test(one(flags, 'target')))) {
       throw new Error('Vision fast-path actions currently require --operation click and --target x,y');
     }
@@ -553,6 +567,19 @@ async function main() {
       throw new Error('--extract-attribute must be a valid HTML attribute name');
     }
     const target = one(flags, 'target');
+    const matchMode = one(flags, 'match-mode', false) ?? 'strict';
+    if (!['strict', 'first', 'all'].includes(matchMode)) {
+      throw new Error('--match-mode must be strict, first, or all');
+    }
+    const nthValue = one(flags, 'nth', false);
+    const nth = nthValue === undefined ? null : Number(nthValue);
+    if (nth !== null && (!Number.isInteger(nth) || nth < 0)) {
+      throw new Error('--nth must be a non-negative integer');
+    }
+    const timeoutMs = Number(one(flags, 'timeout-ms', false) ?? 10000);
+    const stableMs = Number(one(flags, 'stable-ms', false) ?? 300);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error('--timeout-ms must be non-negative');
+    if (!Number.isFinite(stableMs) || stableMs < 0) throw new Error('--stable-ms must be non-negative');
     const locatorKind = one(flags, 'locator-kind', false);
     if (locatorKind && !LOCATOR_KINDS.has(locatorKind)) {
       throw new Error(`Locator kind must be one of: ${[...LOCATOR_KINDS].join(', ')}`);
@@ -581,6 +608,12 @@ async function main() {
       extractTo: '',
       extractAttribute: '',
       tabRole: '',
+      hasTextFrom: '',
+      matchMode: 'strict',
+      nth: null,
+      waitFor: 'visible',
+      timeoutMs: 10000,
+      stableMs: 300,
       postcondition: '',
       candidates: [],
       createdAt: now,
@@ -591,6 +624,12 @@ async function main() {
     action.extractTo = one(flags, 'extract-to', false) ?? action.extractTo ?? '';
     action.extractAttribute = extractAttribute || action.extractAttribute || '';
     action.tabRole = one(flags, 'tab-role', false) ?? action.tabRole ?? '';
+    action.hasTextFrom = one(flags, 'has-text-from', false) ?? action.hasTextFrom ?? '';
+    action.matchMode = matchMode;
+    action.nth = nth;
+    action.waitFor = waitFor;
+    action.timeoutMs = timeoutMs;
+    action.stableMs = stableMs;
     action.postcondition = one(flags, 'postcondition');
     const existing = action.candidates.find((candidate) => candidate.id === id);
     if (existing) {

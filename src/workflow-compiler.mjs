@@ -41,6 +41,10 @@ function parseArgs(argv) {
     const token = argv[index];
     if (!token.startsWith('--')) throw new Error(`Unexpected argument: ${token}`);
     const key = token.slice(2);
+    if (key === 'help') {
+      flags.help = ['true'];
+      continue;
+    }
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`Missing value for --${key}`);
     (flags[key] ??= []).push(value);
@@ -64,6 +68,38 @@ function safeName(value, label = 'name') {
 
 function unique(values = []) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeAssertions(values = [], label = 'asserts') {
+  return values.map((assertion, index) => {
+    if (!assertion?.key || assertion.value === undefined) {
+      throw new Error(`${label}[${index}] requires key and value`);
+    }
+    return {
+      key: assertion.key,
+      value: assertion.value,
+      description: assertion.description?.trim() ?? '',
+    };
+  });
+}
+
+function normalizeComputations(values = [], label = 'computes') {
+  return values.map((computation, index) => {
+    if (!computation?.key || !computation.op) {
+      throw new Error(`${label}[${index}] requires key and op`);
+    }
+    const target = computation.target ?? 'fact';
+    if (!['fact', 'output'].includes(target)) {
+      throw new Error(`${label}[${index}].target must be fact or output`);
+    }
+    return {
+      ...structuredClone(computation),
+      key: computation.key,
+      op: computation.op,
+      target,
+      description: computation.description?.trim() ?? '',
+    };
+  });
 }
 
 function affinityKey(affinity = {}) {
@@ -102,6 +138,8 @@ function normalizeTransaction(raw, index) {
     requires: unique(raw.requires),
     produces: unique(raw.produces),
     collects: unique(raw.collects),
+    asserts: normalizeAssertions(raw.asserts, `${id}.asserts`),
+    computes: normalizeComputations(raw.computes, `${id}.computes`),
     after: unique(raw.after).map((value) => safeName(value, `${id}.after`)),
     barrier,
     risk,
@@ -208,6 +246,8 @@ function fuseTransactions(ordered) {
     previous.sourceNodeIds.push(...node.sourceNodeIds);
     previous.produces = unique([...previous.produces, ...node.produces]);
     previous.collects = unique([...previous.collects, ...node.collects]);
+    previous.asserts.push(...node.asserts);
+    previous.computes.push(...node.computes);
     const producedInside = new Set(previous.produces);
     previous.requires = unique([...previous.requires, ...node.requires])
       .filter((fact) => !producedInside.has(fact));
@@ -252,6 +292,8 @@ export function compileWorkflowSpec(spec) {
     requires: node.requires,
     produces: node.produces,
     collects: node.collects,
+    asserts: node.asserts,
+    computes: node.computes,
     dependsOn: node.dependsOn,
     after: node.after,
     barrier: node.barrier,
@@ -261,6 +303,19 @@ export function compileWorkflowSpec(spec) {
     executionOrder: index,
     routes: node.routes,
   }));
+  const validationWarnings = nodes.flatMap((node) => {
+    const supplied = new Set([
+      ...node.collects,
+      ...node.asserts.map((assertion) => assertion.key),
+      ...node.computes.filter((computation) => computation.target === 'fact').map((computation) => computation.key),
+    ]);
+    const missing = node.produces.filter((key) => !supplied.has(key));
+    return missing.length === 0 ? [] : [{
+      nodeId: node.id,
+      reason: 'Declared produced facts have no collect, assert, or compute source',
+      facts: missing,
+    }];
+  });
   return {
     workflow: {
       name: spec.workflow?.name ?? '',
@@ -273,6 +328,7 @@ export function compileWorkflowSpec(spec) {
     policies: spec.policies ?? [],
     constraints: spec.constraints ?? [],
     nodes,
+    validationWarnings,
     optimization: {
       sourceTransactionCount: transactions.length,
       executableTransactionCount: nodes.length,
@@ -388,7 +444,7 @@ async function main() {
     };
   });
   compiled.migrationWarnings = migrationWarnings;
-  definition.schemaVersion = 3;
+  definition.schemaVersion = 4;
   definition.compiled = {
     ...definition.compiled,
     ...compiled,
@@ -401,6 +457,7 @@ async function main() {
     prompt: identity,
     recipeVersion: definition.compiled.version,
     optimization: compiled.optimization,
+    validationWarnings: compiled.validationWarnings,
     migrationWarnings,
     nodes: compiled.nodes.map(({ id, title, affinity, requires, produces, barrier, sourceNodeIds }) => ({
       id,
