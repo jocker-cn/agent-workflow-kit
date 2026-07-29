@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compile Browser Workflows"
+  short_description: "Compile browser prompts into page transactions"
+  default_prompt: "Use $compile-browser-workflows to compile this business prompt into an optimized resumable browser workflow."
