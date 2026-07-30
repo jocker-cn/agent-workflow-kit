@@ -140,6 +140,76 @@ Use runtime confirmation only when the Prompt requests it or additional authorit
 }
 ```
 
+A run-time count must not change the compiled node count. Use one parameterized browser
+transaction:
+
+```json
+{
+  "id": "submit-resources",
+  "title": "Submit the requested resources",
+  "type": "browser",
+  "risk": "irreversible",
+  "authorization": {
+    "mode": "prompt",
+    "scope": "Submit the requested resource batch",
+    "countFrom": "num",
+    "maxCount": 100
+  },
+  "iteration": {
+    "mode": "repeat",
+    "countFrom": "num",
+    "indexAs": "resourceIndex",
+    "itemAs": "resource",
+    "maxIterations": 100,
+    "generate": {
+      "price": {
+        "op": "random-int",
+        "min": 10,
+        "max": 100
+      },
+      "nonce": {
+        "op": "random-string",
+        "length": 8
+      }
+    },
+    "generateByRoute": {
+      "xiaohongshu": {
+        "name": {
+          "op": "template",
+          "template": "xhs-resource-${loop.iteration}"
+        },
+        "profileUrl": {
+          "op": "copy",
+          "from": "xiaohongshu.profileUrl"
+        }
+      },
+      "weibo": {
+        "name": {
+          "op": "template",
+          "template": "weibo-resource-${loop.iteration}"
+        },
+        "accountUrl": {
+          "op": "copy",
+          "from": "weibo.accountUrl"
+        }
+      }
+    }
+  },
+  "dependsOn": ["resourceType"],
+  "routes": [
+    {"id": "xiaohongshu", "when": {"resourceType": "小红书资源"}},
+    {"id": "weibo", "when": {"resourceType": "微博资源"}}
+  ]
+}
+```
+
+Cached actions for this transaction read values through `loop.item.name`, `loop.item.price`, and
+other loop fields. For an existing array, use `mode: "foreach"` with `itemsFrom` instead of
+`countFrom`. Structured arrays may be supplied to `workflow init` through `--inputs-file`.
+The Runner resolves the structural route first, then merges common `generate` fields with only
+that route's `generateByRoute` fields. Route guards for such a node therefore cannot depend on
+`loop.*` or the item alias; those values do not exist until after route selection.
+
 A local comparison/report transaction can calculate facts and outputs without returning to the
 model:
 
@@ -191,6 +261,19 @@ model:
 - `runtime` requires a `risk` or `human` barrier and a valid confirmation recorded for the node.
 - An irreversible transaction must explicitly use `prompt` or `runtime`; irreversibility alone
   does not create a barrier.
+- Use `iteration.mode=repeat` with `count` or `countFrom`; use `foreach` with `itemsFrom`.
+- The executor supports deterministic item generators `literal`, `copy`, `template`, `random-int`,
+  `choice`, and `random-string`. Generated values are seeded by run, node, index, and field, then
+  persisted in run loop state.
+- Use `iteration.generate` only for common item fields and
+  `iteration.generateByRoute.<route-id>` for branch-specific fields. Generation rules come from
+  the Workflow Prompt; the framework must not invent uniqueness, ranges, choices, or defaults.
+- A failed iteration keeps its index. An uncertain irreversible attempt is not retried blindly;
+  reconcile the visible external result before resuming.
+- Never expand `num` into numbered transactions.
+- Compile with `--stdin true` when possible. `.workflow-cache` accepts only canonical compiled
+  definitions and shared page-action files; compiler drafts, root JSON, and executable glue are
+  invalid. A diagnostic `--file` input must live outside the cache and be removed afterward.
 - Describe semantic operations here. Stable Playwright locators remain in the page cache.
 - After a same-URL search/filter mutation, learn a structured cache action with
   `--operation wait --wait-for stable`, usually scoped with `--has-text-from <input-or-fact>`.

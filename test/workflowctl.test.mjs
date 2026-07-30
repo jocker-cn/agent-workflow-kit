@@ -37,6 +37,15 @@ function compile(...args) {
   });
 }
 
+function compileStdin(input, ...args) {
+  return execFileSync(process.execPath, [workflowCompiler, ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    input: JSON.stringify(input),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
 function recipe(...args) {
   return execFileSync(process.execPath, [recipeRunner, ...args], {
     cwd: root,
@@ -543,6 +552,70 @@ test('workflow compiler reorders scattered prompt work by dependencies and fuses
   assert.equal(compiled.nodes[0].description.includes('reference range'), true);
 });
 
+test('workflow compiler accepts stdin without creating a cache draft', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `stdin-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/stdin-${suffix}.prompt.md`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Open the requested page and collect its title.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  t.after(async () => {
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+
+  const compiled = JSON.parse(compileStdin({
+    workflow: { name: 'stdin-compile-test' },
+    transactions: [{
+      id: 'collect-title',
+      title: 'Collect the page title',
+      type: 'browser',
+      affinity: { system: 'example', page: 'home', state: 'loaded', tab: 'main' },
+      produces: ['page.title'],
+    }],
+  }, '--prompt-key', prepared.prompt.key, '--stdin', 'true'));
+
+  assert.equal(compiled.nodes.length, 1);
+  assert.equal(compiled.nodes[0].id, 'collect-title');
+  const violations = JSON.parse(
+    cache('status', '--prompt-key', prepared.prompt.key),
+  ).hygieneViolations;
+  assert.deepEqual(violations, []);
+});
+
+test('route-conditional generation rejects inputs that exist only after item generation', () => {
+  assert.throws(
+    () => compileWorkflowSpec({
+      workflow: { name: 'invalid-conditional-generation' },
+      transactions: [{
+        id: 'submit-items',
+        title: 'Submit items',
+        type: 'browser',
+        requires: ['loop.item.type'],
+        iteration: {
+          mode: 'repeat',
+          count: 2,
+          itemAs: 'resource',
+          generateByRoute: {
+            'type-a': {
+              name: { op: 'literal', value: 'A' },
+            },
+          },
+        },
+        routes: [{
+          id: 'type-a',
+          when: { resourceType: 'A' },
+        }],
+      }],
+    }),
+    /requires inputs available before item generation; found loop\.item\.type/,
+  );
+});
+
 test('recipe guards normalize scalar values from workflow facts', async (t) => {
   const suffix = `${process.pid}-${Date.now()}`;
   const promptDir = join(root, '.github', 'prompts');
@@ -1022,6 +1095,270 @@ test('a bounded write explicitly authorized by the Prompt does not pause for con
   assert.deepEqual(state.authorizations, {});
 });
 
+test('parameterized repeat keeps one node, persists generated items, and resumes at the failed index', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `repeat-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-repeat-${suffix}.json`);
+  const fakeRunnerPath = join(root, `.fake-repeat-${suffix}.mjs`);
+  const relativePrompt = `.github/prompts/repeat-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-repeat-${suffix}.json`;
+  const relativeFakeRunner = `.fake-repeat-${suffix}.mjs`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Generate and submit num resources.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(fakeRunnerPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: { name: 'repeat-test' },
+    inputs: [
+      { key: 'num', required: true, structural: false },
+      { key: 'resourceType', required: true, structural: true },
+    ],
+    transactions: [{
+      id: 'submit-resources',
+      title: 'Submit resources',
+      type: 'browser',
+      risk: 'irreversible',
+      authorization: {
+        mode: 'prompt',
+        scope: 'Submit the requested resource batch',
+        countFrom: 'num',
+        maxCount: 10,
+      },
+      iteration: {
+        mode: 'repeat',
+        countFrom: 'num',
+        indexAs: 'resourceIndex',
+        itemAs: 'resource',
+        maxIterations: 10,
+        generate: {
+          price: { op: 'random-int', min: 10, max: 99 },
+          nonce: { op: 'random-string', length: 6 },
+        },
+        generateByRoute: {
+          xiaohongshu: {
+            name: { op: 'template', template: 'xhs-resource-${loop.iteration}' },
+            xhsOnly: { op: 'literal', value: true },
+          },
+          weibo: {
+            name: { op: 'template', template: '${loop.item.prefix}-${loop.iteration}' },
+            prefix: { op: 'literal', value: 'weibo-resource' },
+            weiboOnly: { op: 'literal', value: true },
+          },
+        },
+      },
+      affinity: { system: 'example', page: 'form', state: 'ready', tab: 'main' },
+      dependsOn: ['resourceType'],
+      routes: [
+        {
+          id: 'xiaohongshu',
+          when: { resourceType: '小红书资源' },
+          signature: 'xiaohongshu',
+          status: 'learned',
+          actions: [],
+          expectation: null,
+        },
+        {
+          id: 'weibo',
+          when: { resourceType: '微博资源' },
+          signature: 'weibo',
+          status: 'learned',
+          actions: [],
+          expectation: null,
+        },
+      ],
+    }],
+  }, null, 2), 'utf8');
+  const compiled = JSON.parse(compile(
+    '--prompt-key', prepared.prompt.key, '--file', relativeCompiler,
+  ));
+  assert.equal(compiled.optimization.executableTransactionCount, 1);
+  assert.equal(compiled.nodes[0].iteration.countFrom, 'num');
+
+  id = runId(run(
+    'init', '--summary', 'Submit three resources', '--name', 'repeat-test',
+    '--prompt-key', prepared.prompt.key, '--input', 'num=3',
+    '--input', 'resourceType=微博资源',
+  ));
+  await writeFile(fakeRunnerPath, `
+import { existsSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const args = process.argv.slice(2);
+const value = name => args[args.indexOf(name) + 1];
+const runId = value('--run');
+const nodeId = value('--node');
+const assignments = args.flatMap((item, index) => item === '--value' ? [args[index + 1]] : []);
+const get = key => assignments.find(item => item.startsWith(key + '='))?.slice(key.length + 1);
+const iteration = Number(get('loop.iteration'));
+const marker = join(process.cwd(), '.workflow-runs', runId, '.iteration-2-failed');
+const shouldFail = iteration === 2 && !existsSync(marker);
+if (shouldFail) await writeFile(marker, 'failed once', 'utf8');
+const commitFile = \`.workflow-runs/\${runId}/last-boundary.json\`;
+await writeFile(join(process.cwd(), commitFile), JSON.stringify({
+  runStatus: shouldFail ? 'repair_required' : 'active',
+  step: {
+    id: nodeId,
+    title: 'Submit resources',
+    status: shouldFail ? 'blocked' : 'completed',
+    note: shouldFail ? 'Timeout after submit' : 'Synthetic iteration success'
+  },
+  cursor: { step: nodeId, next: 'Continue', system: 'example', url: 'https://example.test/form' },
+  telemetry: {
+    kind: 'transaction',
+    batchId: \`repeat-\${iteration}\`,
+    nodeId,
+    routeId: 'weibo',
+    durationMs: 1,
+    status: shouldFail ? 'failure' : 'success'
+  }
+}));
+console.log(JSON.stringify({
+  status: shouldFail ? 'failure' : 'success',
+  routeId: 'weibo',
+  batchId: \`repeat-\${iteration}\`,
+  reason: shouldFail ? 'Timeout after submit' : '',
+  url: 'https://example.test/form',
+  extracted: { submittedName: get('loop.item.name') },
+  results: [],
+  commitFile
+}));
+`, 'utf8');
+
+  assert.throws(
+    () => executeWithEnv(
+      { AGENT_WORKFLOW_RECIPE_RUNNER: relativeFakeRunner },
+      '--run', id, '--retries', '2',
+    ),
+  );
+  const failed = JSON.parse(run('show', '--run', id));
+  assert.equal(failed.status, 'repair_required');
+  assert.equal(failed.loops['submit-resources'].nextIndex, 1);
+  assert.equal(failed.loops['submit-resources'].status, 'failed');
+  assert.equal(failed.loops['submit-resources'].items['1'].name, 'weibo-resource-2');
+  assert.equal(failed.loops['submit-resources'].items['1'].weiboOnly, true);
+  assert.equal(failed.loops['submit-resources'].items['1'].xhsOnly, undefined);
+  const persistedSecondItem = failed.loops['submit-resources'].items['1'];
+
+  const resumed = JSON.parse(executeWithEnv(
+    { AGENT_WORKFLOW_RECIPE_RUNNER: relativeFakeRunner },
+    '--run', id,
+  ));
+  assert.equal(resumed.status, 'workflow-segment-complete');
+  assert.equal(resumed.executed.length, 1);
+  assert.equal(resumed.executed[0].iterationCount, 3);
+  assert.equal(resumed.executed[0].resumedFromIndex, 1);
+  const completed = JSON.parse(run('show', '--run', id));
+  assert.equal(completed.plan.length, 1);
+  assert.equal(completed.plan[0].status, 'completed');
+  assert.equal(completed.loops['submit-resources'].status, 'completed');
+  assert.equal(completed.loops['submit-resources'].nextIndex, 3);
+  assert.deepEqual(completed.loops['submit-resources'].items['1'], persistedSecondItem);
+  assert.equal(completed.loops['submit-resources'].results.length, 3);
+});
+
+test('foreach derives its iteration count from structured run inputs', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `foreach-${suffix}.prompt.md`);
+  const compilerPath = join(root, `.compiler-foreach-${suffix}.json`);
+  const inputsPath = join(root, `.inputs-foreach-${suffix}.json`);
+  const relativePrompt = `.github/prompts/foreach-${suffix}.prompt.md`;
+  const relativeCompiler = `.compiler-foreach-${suffix}.json`;
+  const relativeInputs = `.inputs-foreach-${suffix}.json`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Validate every requested resource.\n', 'utf8');
+  await writeFile(inputsPath, JSON.stringify({
+    resources: [{ name: 'A' }, { name: 'B' }],
+  }), 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  let id;
+  t.after(async () => {
+    if (id) await removeRun(id);
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      rm(compilerPath, { force: true }),
+      rm(inputsPath, { force: true }),
+      rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+    ]);
+  });
+  await writeFile(compilerPath, JSON.stringify({
+    workflow: { name: 'foreach-test' },
+    transactions: [{
+      id: 'validate-resources',
+      title: 'Validate resources',
+      type: 'browser',
+      iteration: {
+        mode: 'foreach',
+        itemsFrom: 'resources',
+        itemAs: 'resource',
+        maxIterations: 10,
+      },
+      routes: [{
+        id: 'default',
+        when: {},
+        signature: 'default',
+        status: 'learned',
+        actions: [],
+        expectation: null,
+      }],
+    }],
+  }, null, 2), 'utf8');
+  compile('--prompt-key', prepared.prompt.key, '--file', relativeCompiler);
+  id = runId(run(
+    'init', '--summary', 'Validate two resources', '--name', 'foreach-test',
+    '--prompt-key', prepared.prompt.key, '--inputs-file', relativeInputs,
+  ));
+  const dryRun = JSON.parse(execute('--run', id, '--dry-run', 'true'));
+  assert.equal(dryRun.executed.length, 1);
+  assert.deepEqual(dryRun.executed[0].iteration, {
+    mode: 'foreach',
+    total: 2,
+    nextIndex: 0,
+    generationRouteId: null,
+  });
+});
+
+test('workflow cache rejects and clears non-canonical artifacts at any depth', async (t) => {
+  const draftPath = join(root, '.workflow-cache', `temporary-compiler-${process.pid}.json`);
+  const nestedDraftDir = join(root, '.workflow-cache', `temporary-${process.pid}`);
+  const nestedDraftPath = join(nestedDraftDir, 'compiler.json');
+  await mkdir(nestedDraftDir, { recursive: true });
+  await writeFile(draftPath, '{}\n', 'utf8');
+  await writeFile(nestedDraftPath, '{}\n', 'utf8');
+  t.after(async () => {
+    await Promise.all([
+      rm(draftPath, { force: true }),
+      rm(nestedDraftDir, { recursive: true, force: true }),
+    ]);
+  });
+  assert.throws(
+    () => execute('--run', 'nonexistent-run'),
+    /\.workflow-cache contains non-canonical files/,
+  );
+  const preview = JSON.parse(cache('clear', '--scope', 'drafts'));
+  assert.deepEqual(preview.targets.sort(), [
+    `.workflow-cache/temporary-${process.pid}`,
+    `.workflow-cache/temporary-compiler-${process.pid}.json`,
+  ].sort());
+  const cleared = JSON.parse(cache('clear', '--scope', 'drafts', '--apply', 'true'));
+  assert.equal(cleared.status, 'cleared');
+  assert.equal(existsSync(draftPath), false);
+  assert.equal(existsSync(nestedDraftPath), false);
+  assert.equal(existsSync(nestedDraftDir), false);
+});
+
 test('page switching and coordinate vision actions are batchable cached operations', async (t) => {
   const suffix = `${process.pid}-${Date.now()}`;
   const promptDir = join(root, '.github', 'prompts');
@@ -1106,6 +1443,9 @@ test('official Playwright Skill and prompt-first project guidance are present', 
   assert.match(guidance, /Do not pre-check and post-check every cached click or fill/);
   assert.match(guidance, /num=N.*bounded batch/i);
   assert.match(guidance, /risk.*authorization.*barrier/i);
+  assert.match(guidance, /iteration\.mode=repeat/);
+  assert.match(guidance, /Never create N nodes, N routes, or\s+N scripts/);
+  assert.match(guidance, /\.workflow-cache.*strict canonical whitelist/);
   assert.match(guidance, /pnpm execute/);
   assert.match(guidance, /Prompt paragraph order is a soft hint/);
   assert.equal(existsSync(join(root, 'workflows')), false);

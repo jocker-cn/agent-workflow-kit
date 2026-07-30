@@ -7,6 +7,7 @@ import {
   CACHE_ROOT,
   ROOT,
   atomicWriteJson,
+  cacheHygieneViolations,
   cacheDisplayPaths,
   cachePaths,
   candidateId,
@@ -84,7 +85,7 @@ Commands:
                 [--variant <variant-id>] [--reason <text>] [timing fields]
   action-result-batch [prompt selection] --file <project-relative-json>
   page-invalidate [prompt selection] --page <page-id> [--variant <variant-id>] --reason <text>
-  clear [prompt selection] [--scope <current|pages|workflow>] [--apply <true|false>]
+  clear [prompt selection] [--scope <current|pages|workflow|drafts>] [--apply <true|false>]
 
 Prompt selection is --prompt <path> or the shell-safe --prompt-key <key>. If the workspace has
 exactly one Prompt file, selection can be omitted.
@@ -97,7 +98,8 @@ as order.id stay in run state; only values that change the path belong in route 
 
 clear is preview-only unless --apply true is supplied. "current" removes the current definition
 version, "pages" removes reusable page caches, and "workflow" removes all definition versions and
-page caches belonging to the selected Prompt file.
+page caches belonging to the selected Prompt file. "drafts" removes non-canonical files anywhere
+under .workflow-cache and does not require Prompt selection.
 `);
   process.exit(exitCode);
 }
@@ -178,7 +180,7 @@ function expandAssignments(assignments) {
 }
 
 function bumpRecipe(definition) {
-  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 5);
+  definition.schemaVersion = Math.max(definition.schemaVersion ?? 1, 7);
   definition.compiled.version += 1;
   definition.updatedAt = new Date().toISOString();
 }
@@ -257,7 +259,7 @@ function compilationStatus(definition) {
   const normalized = normalizeDefinition(definition);
   if (normalized.compiled.nodes.length === 0) return 'uncompiled';
   if (
-    normalized.schemaVersion < 5
+    normalized.schemaVersion < 7
     || normalized.compiled.nodes.some((node) => !node.description || !node.affinity)
   ) {
     return 'needs-recompile';
@@ -275,14 +277,35 @@ async function main() {
   }
 
   if (command === 'clear') {
+    const scope = one(flags, 'scope', false) ?? 'current';
+    const apply = (one(flags, 'apply', false) ?? 'false') === 'true';
+    if (scope === 'drafts') {
+      const targets = (await cacheHygieneViolations())
+        .map((target) => resolve(ROOT, target));
+      for (const target of targets) {
+        const relativeTarget = relative(CACHE_ROOT, target);
+        if (relativeTarget.startsWith('..') || isAbsolute(relativeTarget) || relativeTarget === '') {
+          throw new Error(`Refusing to clear unsafe cache draft: ${target}`);
+        }
+      }
+      const result = {
+        status: apply ? 'cleared' : 'preview',
+        scope,
+        targets: targets.map((target) => relative(ROOT, target).replaceAll('\\', '/')),
+      };
+      if (apply) {
+        await Promise.all(targets.map((target) => rm(target, { recursive: true, force: true })));
+      }
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     const identity = await resolvePromptSelection({
       prompt: one(flags, 'prompt', false),
       promptKey: one(flags, 'prompt-key', false),
     });
     const paths = cachePaths(identity);
-    const scope = one(flags, 'scope', false) ?? 'current';
     if (!['current', 'pages', 'workflow'].includes(scope)) {
-      throw new Error('--scope must be current, pages, or workflow');
+      throw new Error('--scope must be current, pages, workflow, or drafts');
     }
     const definitionRoot = dirname(paths.definitionPath);
     const pagesRoot = join(CACHE_ROOT, 'pages', identity.key);
@@ -297,7 +320,6 @@ async function main() {
         throw new Error(`Refusing to clear unsafe cache target: ${target}`);
       }
     }
-    const apply = (one(flags, 'apply', false) ?? 'false') === 'true';
     const result = {
       status: apply ? 'cleared' : 'preview',
       scope,
@@ -318,11 +340,14 @@ async function main() {
 
   if (command === 'prepare' || command === 'status') {
     const definition = await readJson(paths.definitionPath);
+    const hygieneViolations = await cacheHygieneViolations();
     console.log(JSON.stringify({
       prompt: identity,
       cache: cacheDisplayPaths(paths),
       compilerStatus: compilationStatus(definition),
       recipeVersion: normalizeDefinition(definition).compiled.version,
+      cacheHygiene: hygieneViolations.length === 0 ? 'clean' : 'invalid',
+      hygieneViolations,
     }, null, 2));
     return;
   }

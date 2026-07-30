@@ -116,13 +116,16 @@ pnpm run workflow -- context --run <run-id>
 - 缓存由 Agent 自动生成和修复，用户只维护自然语言 Prompt；
 - snapshot ref、凭据、验证码和本次业务变量不会写入缓存。
 
-首次执行时，Agent 生成一份内部编译输入。业务说明保存在 Workflow、事实、策略、事务和
-操作的 `description` 字段中；Skill 只保存所有业务共用的编译算法。该 JSON 是编译中间产物，
-不需要用户维护：
+首次执行时，Agent 在内存中生成内部编译输入。业务说明保存在 Workflow、事实、策略、事务和
+操作的 `description` 字段中；Skill 只保存所有业务共用的编译算法。编译输入通过 stdin
+直接传给编译器，不会在 `.workflow-cache` 中留下临时 JSON：
 
 ```bash
-pnpm compile -- --prompt-key <prompt-key> --file <agent-generated-json>
+<agent-generated-json> | pnpm compile -- --prompt-key <prompt-key> --stdin true
 ```
+
+`--file <compiler-json>` 只用于诊断，并且文件必须位于 `.workflow-cache` 之外，编译后删除。
+Cache 只允许保存正式 Definition 和共享 Page Action；其他文件会被执行器拒绝。
 
 编译器不会机械保留 Prompt 的句子顺序。它保留明确的前后关系、事实依赖、人工边界和高风险
 操作，然后优先排列相同页面状态的任务，并融合兼容事务。之后 Agent 探索页面并学习局部路线
@@ -180,9 +183,26 @@ tab role 在同一浏览器 Session 中切换。某个事务失败后，失败�
 pnpm execute -- --run <run-id> --from <failed-node-id>
 ```
 
+“执行 N 次”不会被展开为 N 个节点、N 条路线或临时脚本。编译器生成一个参数化循环节点：
+
+- `iteration.mode=repeat + countFrom` 从本次 run 的 `num` 等输入取得次数；
+- `iteration.mode=foreach + itemsFrom` 直接遍历本次 run 提供的数组；
+- `iteration.generate` 只生成所有路线共用的字段；
+- `iteration.generateByRoute.<route-id>` 只生成当前业务路线需要的字段。
+
+Runner 在每轮不可逆提交前持久化实际 `loop.item`，成功后推进 `nextIndex`。恢复时复用已经保存
+的 item，不会重新随机生成；字段间的 `copy` 和模板引用也不依赖 JSON 属性书写顺序。价格范围、
+唯一性、候选项等业务规则只能来自 Prompt，框架不会自行添加。
+
 清理 Cache 时先预览准确目标：
 
 ```bash
+# 预览全部非正式 Cache 文件，包括嵌套的遗留 compiler 草稿
+pnpm cachectl clear --scope drafts
+
+# 删除预览出的非正式文件
+pnpm cachectl clear --scope drafts --apply true
+
 # 只清当前 Prompt 正文版本的 Definition
 pnpm cachectl clear --prompt-key <prompt-key> --scope current
 
@@ -205,7 +225,10 @@ pnpm run workflow -- commit --run <run-id> \
 
 Recipe 中跨页面的动作会按连续 Page Variant 分组。对于 SPA 跳转，Runner 会等待下一组页面的 URL、标题和锚点稳定后再继续；重试时如果浏览器已经位于后面的页面组，会从当前匹配组恢复，不会再次要求回到 Recipe 的起始页面。
 
-当批次与预期不一致时才返回 Agent：临时加载问题只重试；locator 变化只修复页面动作；角色、租户或 UI 版本不同则学习新的页面变体；新订单类型学习新的 guarded route；业务顺序改变才升级对应 recipe 节点。
+当批次与预期不一致时才返回 Agent：read/reversible 节点的临时加载问题可自动重试；
+不可逆节点不会自动重试，以免“实际提交成功但结果提示超时”造成重复写入。locator 变化只修复
+页面动作；角色、租户或 UI 版本不同则学习新的页面变体；新订单类型学习新的 guarded route；
+业务顺序改变才升级对应 recipe 节点。
 
 使用 `prompt-key` 是为了避免 Windows shell 对包含中文、空格的 Prompt 路径进行错误拆分。Prompt 文件名和正文不需要因此修改。
 

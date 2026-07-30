@@ -6,6 +6,17 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 export const ROOT = resolve(process.cwd());
 export const CACHE_ROOT = join(ROOT, '.workflow-cache');
 const PROMPTS_ROOT = join(ROOT, '.github', 'prompts');
+const ALLOWED_CACHE_FILES = [
+  /^definitions\/prompt-[a-f0-9]{12}\/[a-f0-9]{16}\.json$/,
+  /^pages\/prompt-[a-f0-9]{12}\/shared\/[a-z][a-z0-9-]*\.json$/,
+];
+const ALLOWED_CACHE_DIRECTORIES = [
+  /^definitions$/,
+  /^definitions\/prompt-[a-f0-9]{12}$/,
+  /^pages$/,
+  /^pages\/prompt-[a-f0-9]{12}$/,
+  /^pages\/prompt-[a-f0-9]{12}\/shared$/,
+];
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -13,6 +24,42 @@ function sha256(value) {
 
 function portablePath(value) {
   return value.split(sep).join('/');
+}
+
+export async function cacheHygieneViolations(directory = CACHE_ROOT) {
+  if (!existsSync(directory)) return [];
+  const violations = [];
+  const visit = async (current) => {
+    const entries = await readdir(current, { withFileTypes: true });
+    await Promise.all(entries.map(async (entry) => {
+      const path = join(current, entry.name);
+      const cacheRelative = portablePath(relative(CACHE_ROOT, path));
+      if (entry.isDirectory()) {
+        if (ALLOWED_CACHE_DIRECTORIES.some((pattern) => pattern.test(cacheRelative))) {
+          await visit(path);
+        } else {
+          violations.push(portablePath(relative(ROOT, path)));
+        }
+      } else if (entry.isFile()) {
+        if (!ALLOWED_CACHE_FILES.some((pattern) => pattern.test(cacheRelative))) {
+          violations.push(portablePath(relative(ROOT, path)));
+        }
+      } else {
+        violations.push(portablePath(relative(ROOT, path)));
+      }
+    }));
+  };
+  await visit(directory);
+  return violations.sort();
+}
+
+export async function assertCacheHygiene() {
+  const violations = await cacheHygieneViolations();
+  if (violations.length > 0) {
+    throw new Error(
+      `.workflow-cache contains non-canonical files: ${violations.join(', ')}`,
+    );
+  }
 }
 
 export async function resolvePromptIdentity(promptFile) {
@@ -105,7 +152,7 @@ export async function ensurePromptCache(identity) {
   if (!existsSync(paths.definitionPath)) {
     const now = new Date().toISOString();
     await atomicWriteJson(paths.definitionPath, {
-      schemaVersion: 5,
+      schemaVersion: 7,
       prompt: identity,
       compiled: {
         version: 1,
@@ -199,6 +246,7 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
       maxCount: null,
       constraints: [],
     };
+    node.iteration ??= null;
     node.dependsOn ??= [];
     node.routes ??= [];
     const enabled = node.routes.filter((route) => route.status !== 'disabled');
@@ -260,6 +308,7 @@ export function resolveWorkflowRecipe(definition, values = {}, onlyNode = null) 
       barrier: node.barrier ?? 'none',
       risk: node.risk ?? 'read',
       authorization: node.authorization,
+      iteration: node.iteration,
       routeId: route.id,
       routeSignature: route.signature,
       actions: route.actions,

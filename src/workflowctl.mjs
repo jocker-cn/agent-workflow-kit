@@ -23,7 +23,7 @@ Prompt workflow state CLI
 Commands:
   init --summary <text> [--intent <sanitized-workflow>]
        [--prompt-file <path> | --prompt-key <key>]
-       [--workflow-name <name>] [--input key=value]...
+       [--workflow-name <name>] [--input key=value]... [--inputs-file <project-json>]
   show --run <run-id>
   status --run <run-id>
   latest [--workflow-name <name>] [--input key=value]...
@@ -145,6 +145,7 @@ function normalizeRun(run) {
     selections: [],
   };
   run.executionHistory ??= [];
+  run.loops ??= {};
   return run;
 }
 
@@ -191,7 +192,7 @@ async function latestRun(name, inputs = {}) {
 }
 
 async function saveRun(run) {
-  run.schemaVersion = 2;
+  run.schemaVersion = 3;
   run.updatedAt = new Date().toISOString();
   const statePath = join(runDir(run.runId), 'state.json');
   const temporaryPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -281,6 +282,7 @@ function compiledWorkflowText(compiled) {
       barrier: node.barrier,
       risk: node.risk,
       authorization: node.authorization,
+      iteration: node.iteration,
     })),
   });
 }
@@ -349,6 +351,10 @@ ${toMarkdown(run.data)}
 
 ${toMarkdown(authorizationsForDisplay(run.authorizations))}
 
+## Loop progress
+
+${toMarkdown(run.loops)}
+
 ## Evidence summary
 
 ${toMarkdown(run.evidenceSummary)}
@@ -383,6 +389,9 @@ async function main() {
       const paths = await ensurePromptCache(identity);
       prompt = { ...identity, cache: cacheDisplayPaths(paths) };
     }
+    const fileInputs = one(flags, 'inputs-file', false)
+      ? await readProjectJson(one(flags, 'inputs-file', false))
+      : {};
     const run = {
       schemaVersion: 2,
       runId,
@@ -393,7 +402,10 @@ async function main() {
       status: 'active',
       createdAt,
       updatedAt: createdAt,
-      inputs: parseInputs(flags.input),
+      inputs: {
+        ...fileInputs,
+        ...parseInputs(flags.input),
+      },
       plan: [],
       facts: {},
       factHistory: [],
@@ -417,6 +429,7 @@ async function main() {
         selections: [],
       },
       executionHistory: [],
+      loops: {},
     };
     await mkdir(runDir(runId), { recursive: true });
     await saveRun(run);
@@ -710,6 +723,16 @@ async function main() {
       run.evidenceRecent.push(item);
     }
     run.evidenceRecent = run.evidenceRecent.slice(-20);
+
+    if (payload.loop) {
+      const nodeId = safeName(payload.loop.nodeId, 'loop node id');
+      run.loops[nodeId] = {
+        ...(run.loops[nodeId] ?? {}),
+        ...payload.loop,
+        nodeId,
+        updatedAt: at,
+      };
+    }
 
     if (payload.telemetry) {
       const event = {

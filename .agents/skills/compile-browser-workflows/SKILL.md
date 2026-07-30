@@ -36,24 +36,38 @@ the user to author nodes, selectors, YAML, or a business Skill.
    transaction. Split only at a navigation state that changes the affinity or at a declared
    barrier.
    Collect all later-needed fields before leaving the page.
-6. For a same-route SPA mutation, insert one structured wait before dependent reads. Prefer a
+6. Compile run-time repetition parametrically:
+   - use `iteration.mode=repeat` with `countFrom` for “perform N times”;
+   - use `iteration.mode=foreach` with `itemsFrom` for collections;
+   - use `loop.item` in cached actions and keep the compiled node count invariant for every run;
+   - use declarative `iteration.generate` only for fields common to every route;
+   - use `iteration.generateByRoute.<route-id>` for fields needed only by one structural branch.
+   Runtime arrays supply `foreach` items directly. For `repeat`, the executor selects the route
+   from run inputs, deterministically creates the route-shaped item, and persists it so retries
+   reuse it. Do not invent uniqueness, value ranges, choices, or other business rules that are not
+   present in the Workflow Prompt.
+   Never unroll a current `num` into numbered nodes or routes, and never create parameter-specific
+   orchestration scripts.
+7. For a same-route SPA mutation, insert one structured wait before dependent reads. Prefer a
    parameterized target that proves the requested business object is present, then require stable
    content for a short interval. Do not treat a prose postcondition as executable synchronization.
-7. For lists and tables, bind the locator to the run input or fact with `hasTextFrom`; select an
+8. For lists and tables, bind the locator to the run input or fact with `hasTextFrom`; select an
    explicit cardinality. Use `strict` when exactly one match is a business invariant, `first` only
    when first-match semantics are intentional, and `nth` only when rank is the requested input.
-8. Model a tab in `affinity.tab`. The executor re-identifies transaction entry across the browser
+9. Model a tab in `affinity.tab`. The executor re-identifies transaction entry across the browser
    context from page fingerprints. Add `switch-page` only directly after an action opens a tab
    inside the same transaction, not as a repair for lost focus between transactions.
-9. Store workflow-specific descriptions in the compiler artifact fields. Keep this Skill limited
+10. Store workflow-specific descriptions in the compiler artifact fields. Keep this Skill limited
    to reusable compilation behavior.
-10. Write the internal compiler JSON inside the project and run:
+11. Prefer streaming the internal compiler JSON without creating a draft:
 
    ```bash
-   pnpm compile -- --prompt-key <prompt-key> --file <compiler-json>
+   <producer> | pnpm compile -- --prompt-key <prompt-key> --stdin true
    ```
 
-11. Inspect the compiler result. Learn or repair page actions against the generated transactions.
+   For diagnostics only, `--file <compiler-json>` is supported when the file is outside
+   `.workflow-cache`; remove the file after compilation.
+12. Inspect the compiler result. Learn or repair page actions against the generated transactions.
    The user must not maintain the compiler JSON.
 
 Read [references/compiler-schema.md](references/compiler-schema.md) when constructing the compiler
@@ -79,3 +93,15 @@ pnpm execute -- --run <run-id> --from <failed-node-id>
 ```
 
 Persist state at transaction boundaries, not after individual clicks or extracted fields.
+For iteration nodes, the executor records the item, result, and `nextIndex` after every iteration.
+Resume the same node; do not generate a recovery script or expand the remaining indexes.
+Automatic transient retries are limited to read or reversible nodes. An irreversible failure
+returns to the Agent for visible-result reconciliation before another execution is started.
+
+Treat `.workflow-cache` as strict canonical storage. The only valid files are compiled definitions
+under `definitions/<prompt-key>/<prompt-hash>.json` and shared page actions under
+`pages/<prompt-key>/shared/<page-id>.json`. Compiler drafts, root JSON, executables, and
+orchestration files are invalid even when temporary. Executor-created temporary Playwright files
+belong to the run directory and are removed automatically. Preview legacy cache drafts with
+`pnpm cachectl clear --scope drafts`; the preview includes non-canonical artifacts at any cache
+depth. Remove them with the same command plus `--apply true`.

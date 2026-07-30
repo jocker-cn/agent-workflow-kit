@@ -26,6 +26,18 @@ configuration file, selector map, or project-specific script before starting.
 - Group compatible work by system, page kind, material page state, tab role, and variant. If the
   Prompt mentions fields from the same stable page in different places, collect their union during
   one page transaction.
+- Treat counts and collections supplied at run time as parameters, never as compiler topology.
+  Compile “repeat N times” as one transaction with `iteration.mode=repeat` and `countFrom`; compile
+  “for each item” with `iteration.mode=foreach` and `itemsFrom`. Never create N nodes, N routes, or
+  N scripts from the current value of `num` or an array length.
+- Address the active item through `loop.index`, `loop.iteration`, `loop.item`, or the declared
+  iteration aliases. Persist generated items before irreversible execution and resume from the
+  saved `nextIndex`; do not regenerate an item after a failure.
+- Derive loop data from the Prompt and current run, not from framework defaults. Runtime arrays
+  supply `foreach` items directly. For `repeat`, put fields shared by every route in
+  `iteration.generate` and put branch-only fields in `iteration.generateByRoute.<route-id>`.
+  Resolve the route from structural run inputs before generating the item. Do not invent business
+  constraints such as uniqueness, price ranges, or option sets unless the Prompt declares them.
 - Classify every produced value as exactly one of: page `collects`, boundary `asserts`, or local
   `computes`. Never manually add a fact that the compiled transaction declares as produced.
 - Store workflow-specific explanatory text in the compiled Workflow fields (`description`,
@@ -70,6 +82,17 @@ configuration file, selector map, or project-specific script before starting.
 - Keep high-cardinality instance values such as order ids, ticket ids, resource names, and branches in run inputs. Put only values that change execution structure, such as order type or environment, in a route's `--when` guards.
 - Declare each node's routing dependencies with `--depends-on`. Resolve a run with `recipe-resolve --value key=value`. A `ready` result is executable; `needs-facts` means observe only the missing facts; `needs-learning` or `ambiguous` returns control to the model for that node only. Never execute another route as a fallback for an unknown value.
 - Page caches store named variants. A variant represents a material UI context such as role, locale, tenant, or page version, and contains a fingerprint, semantic actions, locator candidates, postconditions, and result telemetry. They must not store snapshot refs, live DOM nodes, credentials, verification values, cookies, tokens, or run-specific business values.
+- `.workflow-cache` has a strict canonical whitelist: compiled definitions belong only at
+  `definitions/<prompt-key>/<prompt-hash>.json`, and reusable page actions belong only at
+  `pages/<prompt-key>/shared/<page-id>.json`. Every other file, including compiler drafts and
+  otherwise declarative root JSON, is invalid. Reusable implementation belongs in `src`;
+  run-specific JSON, evidence, and executor-generated temporary files belong under
+  `.workflow-runs/<run-id>`.
+- Prefer `pnpm compile -- --prompt-key <prompt-key> --stdin true` and pipe the compiler artifact
+  through stdin. If a diagnostic compiler file is necessary, keep it outside `.workflow-cache`
+  and remove it after compilation. Use `pnpm cachectl clear --scope drafts` to preview legacy
+  non-canonical artifacts at any cache depth and add `--apply true` only when they should be
+  removed.
 - On a valid recipe and page-variant hit, execute the continuous cached browser segment through
   `pnpm execute -- --run <run-id>`. It executes successive page transactions, commits their
   resumable boundaries, resolves cached decision and report nodes locally, and stops only for a
@@ -97,7 +120,8 @@ configuration file, selector map, or project-specific script before starting.
   and visual anchors match.
 - Do not pre-check and post-check every cached click or fill. Validate once at page entry when the variant is uncertain and once at the business boundary. Use screenshots or targeted checks only for evidence, branching, or recovery.
 - If a cached batch fails or its boundary postcondition is false: stop at the failed action, record the batch failure, take a screenshot, and inspect only the relevant page region. Classify the failure before updating cache:
-  - retry transient loading or timing failures without changing cache;
+  - retry transient loading or timing failures without changing cache only for read or reversible
+    nodes; never automatically retry an irreversible node whose external result may be uncertain;
   - repair the locator candidate when business meaning is unchanged;
   - learn a new page variant when role, locale, tenant, or UI version changed;
   - learn a new guarded recipe route when a previously unseen business type appears;

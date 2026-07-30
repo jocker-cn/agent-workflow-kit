@@ -5,7 +5,9 @@ import { readFile } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  CACHE_ROOT,
   ROOT,
+  assertCacheHygiene,
   atomicWriteJson,
   ensurePromptCache,
   normalizeDefinition,
@@ -24,7 +26,7 @@ function usage(exitCode = 0) {
 Compile an Agent-produced workflow intent into an optimized cached Workflow Recipe.
 
 Usage:
-  pnpm compile -- --file <project-relative-json>
+  pnpm compile -- (--file <project-relative-json> | --stdin true)
                   [--prompt <file> | --prompt-key <key>] [--dry-run true]
 
 The input is an internal compiler artifact, not a user-authored configuration file. It contains
@@ -103,6 +105,54 @@ function normalizeComputations(values = [], label = 'computes') {
   });
 }
 
+function normalizeIteration(raw, id) {
+  if (!raw) return null;
+  const mode = raw.mode ?? (raw.itemsFrom ? 'foreach' : 'repeat');
+  if (!['repeat', 'foreach'].includes(mode)) {
+    throw new Error(`${id}.iteration.mode must be repeat or foreach`);
+  }
+  if (mode === 'repeat' && !raw.countFrom && raw.count === undefined) {
+    throw new Error(`${id}.iteration repeat requires countFrom or count`);
+  }
+  if (mode === 'foreach' && !raw.itemsFrom) {
+    throw new Error(`${id}.iteration foreach requires itemsFrom`);
+  }
+  if (raw.count !== undefined && (!Number.isInteger(raw.count) || raw.count < 1)) {
+    throw new Error(`${id}.iteration.count must be a positive integer`);
+  }
+  const maxIterations = raw.maxIterations ?? 1000;
+  if (!Number.isInteger(maxIterations) || maxIterations < 1) {
+    throw new Error(`${id}.iteration.maxIterations must be a positive integer`);
+  }
+  if (raw.generate && (typeof raw.generate !== 'object' || Array.isArray(raw.generate))) {
+    throw new Error(`${id}.iteration.generate must be an object`);
+  }
+  if (raw.generateByRoute
+    && (typeof raw.generateByRoute !== 'object' || Array.isArray(raw.generateByRoute))) {
+    throw new Error(`${id}.iteration.generateByRoute must be an object`);
+  }
+  const generateByRoute = Object.fromEntries(
+    Object.entries(raw.generateByRoute ?? {}).map(([routeId, generator]) => {
+      safeName(routeId, `${id}.iteration.generateByRoute route`);
+      if (!generator || typeof generator !== 'object' || Array.isArray(generator)) {
+        throw new Error(`${id}.iteration.generateByRoute.${routeId} must be an object`);
+      }
+      return [routeId, structuredClone(generator)];
+    }),
+  );
+  return {
+    mode,
+    count: raw.count ?? null,
+    countFrom: raw.countFrom?.trim() || '',
+    itemsFrom: raw.itemsFrom?.trim() || '',
+    indexAs: raw.indexAs?.trim() || 'iterationIndex',
+    itemAs: raw.itemAs?.trim() || 'iterationItem',
+    maxIterations,
+    generate: structuredClone(raw.generate ?? {}),
+    generateByRoute,
+  };
+}
+
 function affinityKey(affinity = {}) {
   return [
     affinity.system ?? '',
@@ -169,6 +219,28 @@ function normalizeTransaction(raw, index) {
           : 'none'
   );
   if (!BARRIERS.has(barrier)) throw new Error(`Unsupported barrier: ${barrier}`);
+  const iteration = normalizeIteration(raw.iteration, id);
+  if (iteration && type !== 'browser') {
+    throw new Error(`${id}.iteration is currently supported only for browser transactions`);
+  }
+  if (iteration && Object.keys(iteration.generateByRoute).length > 0) {
+    const preGenerationReferences = [
+      ...unique(raw.requires),
+      ...unique(raw.dependsOn),
+      ...(raw.routes ?? []).flatMap((route) => Object.keys(route.when ?? {})),
+    ];
+    const generatedGuard = preGenerationReferences.find((key) => (
+        key === 'loop'
+        || key.startsWith('loop.')
+        || key === iteration.itemAs
+        || key.startsWith(`${iteration.itemAs}.`)
+    ));
+    if (generatedGuard) {
+      throw new Error(
+        `${id}.iteration.generateByRoute requires inputs available before item generation; found ${generatedGuard}`,
+      );
+    }
+  }
   if (authorization.mode === 'runtime' && !['risk', 'human'].includes(barrier)) {
     throw new Error(`Runtime authorization for ${id} requires a risk or human barrier`);
   }
@@ -192,6 +264,7 @@ function normalizeTransaction(raw, index) {
     collects: unique(raw.collects),
     asserts: normalizeAssertions(raw.asserts, `${id}.asserts`),
     computes: normalizeComputations(raw.computes, `${id}.computes`),
+    iteration,
     after: unique(raw.after).map((value) => safeName(value, `${id}.after`)),
     barrier,
     risk,
@@ -280,6 +353,8 @@ function canFuse(left, right) {
     && right.barrier === 'none'
     && left.risk !== 'irreversible'
     && right.risk !== 'irreversible'
+    && !left.iteration
+    && !right.iteration
     && left.authorization.mode === right.authorization.mode
     && (
       left.authorization.mode === 'not-required'
@@ -352,6 +427,7 @@ export function compileWorkflowSpec(spec) {
     collects: node.collects,
     asserts: node.asserts,
     computes: node.computes,
+    iteration: node.iteration,
     dependsOn: node.dependsOn,
     after: node.after,
     barrier: node.barrier,
@@ -470,20 +546,37 @@ async function readProjectJson(file) {
   if (pathFromRoot.startsWith('..') || isAbsolute(pathFromRoot)) {
     throw new Error('--file must be inside the project');
   }
+  const pathFromCache = relative(CACHE_ROOT, absolute);
+  if (!pathFromCache.startsWith('..') && !isAbsolute(pathFromCache)) {
+    throw new Error('Compiler input drafts must not be stored in .workflow-cache');
+  }
   return JSON.parse(await readFile(absolute, 'utf8'));
+}
+
+async function readStdinJson() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  const input = Buffer.concat(chunks).toString('utf8').trim();
+  if (!input) throw new Error('Compiler stdin is empty');
+  return JSON.parse(input);
 }
 
 async function main() {
   const flags = parseArgs(process.argv.slice(2));
   if (flags.help) usage();
-  const file = one(flags, 'file');
-  if (!existsSync(resolve(ROOT, file))) throw new Error(`Compiler input not found: ${file}`);
+  await assertCacheHygiene();
+  const file = one(flags, 'file', false);
+  const useStdin = (one(flags, 'stdin', false) ?? 'false') === 'true';
+  if (Boolean(file) === useStdin) {
+    throw new Error('Use exactly one compiler input: --file <json> or --stdin true');
+  }
+  if (file && !existsSync(resolve(ROOT, file))) throw new Error(`Compiler input not found: ${file}`);
   const identity = await resolvePromptSelection({
     prompt: one(flags, 'prompt', false),
     promptKey: one(flags, 'prompt-key', false),
   });
   const paths = await ensurePromptCache(identity);
-  const compiled = compileWorkflowSpec(await readProjectJson(file));
+  const compiled = compileWorkflowSpec(useStdin ? await readStdinJson() : await readProjectJson(file));
   if ((one(flags, 'dry-run', false) ?? 'false') === 'true') {
     console.log(JSON.stringify({ prompt: identity, compiled }, null, 2));
     return;
@@ -503,7 +596,7 @@ async function main() {
     };
   });
   compiled.migrationWarnings = migrationWarnings;
-  definition.schemaVersion = 5;
+  definition.schemaVersion = 7;
   definition.compiled = {
     ...definition.compiled,
     ...compiled,
@@ -519,7 +612,7 @@ async function main() {
     validationWarnings: compiled.validationWarnings,
     migrationWarnings,
     nodes: compiled.nodes.map(({
-      id, title, affinity, requires, produces, barrier, risk, authorization, sourceNodeIds,
+      id, title, affinity, requires, produces, barrier, risk, authorization, iteration, sourceNodeIds,
     }) => ({
       id,
       title,
@@ -529,6 +622,7 @@ async function main() {
       barrier,
       risk,
       authorization,
+      iteration,
       sourceNodeIds,
     })),
   }, null, 2));

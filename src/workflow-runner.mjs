@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import {
   ROOT,
+  assertCacheHygiene,
   atomicWriteJson,
   cachePaths,
   normalizeDefinition,
@@ -184,6 +186,196 @@ function localComputationPayload(node, run, explicitValues) {
   return { facts, outputs, values };
 }
 
+function flattenAssignments(value, prefix = '', output = []) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      flattenAssignments(child, prefix ? `${prefix}.${key}` : key, output);
+    }
+  } else if (prefix) {
+    output.push(`${prefix}=${Array.isArray(value) ? JSON.stringify(value) : String(value ?? '')}`);
+  }
+  return output;
+}
+
+function deterministicNumber(seed) {
+  return createHash('sha256').update(seed).digest().readUInt32BE(0) / 0x100000000;
+}
+
+function renderTemplate(template, values) {
+  return String(template ?? '').replace(/\$\{([^}]+)\}/g, (_, key) => {
+    const value = nestedValue(values, key);
+    if (value === undefined) {
+      const error = new Error(`Iteration template value is missing: ${key}`);
+      error.code = 'ITERATION_VALUE_MISSING';
+      throw error;
+    }
+    return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  });
+}
+
+function generatedValue(spec, values, seed) {
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return spec;
+  switch (spec.op ?? 'literal') {
+    case 'literal':
+      return spec.value;
+    case 'copy': {
+      const value = nestedValue(values, spec.from);
+      if (value === undefined) {
+        const error = new Error(`Iteration copy value is missing: ${spec.from}`);
+        error.code = 'ITERATION_VALUE_MISSING';
+        throw error;
+      }
+      return value;
+    }
+    case 'template':
+      return renderTemplate(spec.template, values);
+    case 'random-int': {
+      const min = Number(spec.min);
+      const max = Number(spec.max);
+      if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
+        throw new Error('random-int requires integer min and max with max >= min');
+      }
+      return min + Math.floor(deterministicNumber(seed) * (max - min + 1));
+    }
+    case 'choice': {
+      if (!Array.isArray(spec.values) || spec.values.length === 0) {
+        throw new Error('choice requires a non-empty values array');
+      }
+      return spec.values[Math.floor(deterministicNumber(seed) * spec.values.length)];
+    }
+    case 'random-string': {
+      const length = Number(spec.length);
+      const alphabet = spec.alphabet ?? 'abcdefghijklmnopqrstuvwxyz0123456789';
+      if (!Number.isInteger(length) || length < 1 || !alphabet) {
+        throw new Error('random-string requires positive length and a non-empty alphabet');
+      }
+      return Array.from({ length }, (_, offset) => (
+        alphabet[Math.floor(deterministicNumber(`${seed}\0${offset}`) * alphabet.length)]
+      )).join('');
+    }
+    default:
+      throw new Error(`Unsupported iteration generator: ${spec.op}`);
+  }
+}
+
+function createIterationItem(node, run, index, total, sourceItem, explicitValues, routeId = '') {
+  const item = sourceItem && typeof sourceItem === 'object'
+    ? structuredClone(sourceItem)
+    : sourceItem === undefined
+      ? {}
+      : { value: sourceItem };
+  const loop = { index, iteration: index + 1, count: total, item };
+  const values = transactionValues(run, explicitValues);
+  values.loop = loop;
+  setPath(values, node.iteration.indexAs, index);
+  setPath(values, node.iteration.itemAs, item);
+  const routeGenerator = routeId ? node.iteration.generateByRoute?.[routeId] ?? {} : {};
+  const generator = {
+    ...(node.iteration.generate ?? {}),
+    ...routeGenerator,
+  };
+  const pending = new Map(Object.entries(generator));
+  let lastMissing = null;
+  while (pending.size > 0) {
+    let generated = 0;
+    for (const [key, spec] of pending) {
+      const seed = `${run.runId}\0${node.id}\0${index}\0${key}`;
+      let value;
+      try {
+        value = generatedValue(spec, values, seed);
+      } catch (error) {
+        if (error.code === 'ITERATION_VALUE_MISSING') {
+          lastMissing = error;
+          continue;
+        }
+        throw error;
+      }
+      setPath(item, key, value);
+      setPath(values, `loop.item.${key}`, value);
+      setPath(values, `${node.iteration.itemAs}.${key}`, value);
+      pending.delete(key);
+      generated += 1;
+    }
+    if (generated === 0) {
+      throw new Error(
+        `Iteration generators for ${node.id} have unresolved or cyclic dependencies: `
+        + `${[...pending.keys()].join(', ')}${lastMissing ? ` (${lastMissing.message})` : ''}`,
+      );
+    }
+  }
+  return item;
+}
+
+function iterationDescriptor(node, run, explicitValues) {
+  if (!node.iteration) return null;
+  const values = transactionValues(run, explicitValues);
+  const previous = run.loops?.[node.id] ?? {};
+  if (previous.status === 'attempting') {
+    return {
+      error: `Iteration ${previous.attemptingIndex + 1} for ${node.id} has an uncertain external result; reconcile it before retrying`,
+    };
+  }
+  let items = null;
+  let total;
+  if (node.iteration.mode === 'foreach') {
+    items = nestedValue(values, node.iteration.itemsFrom);
+    if (!Array.isArray(items)) {
+      return { error: `Iteration source ${node.iteration.itemsFrom} must be an array` };
+    }
+    total = items.length;
+  } else {
+    const rawCount = node.iteration.countFrom
+      ? nestedValue(values, node.iteration.countFrom)
+      : node.iteration.count;
+    total = Number(rawCount);
+    if (!Number.isInteger(total) || total < 1) {
+      return { error: `Iteration count for ${node.id} must be a positive integer` };
+    }
+  }
+  if (total > node.iteration.maxIterations) {
+    return {
+      error: `Iteration count ${total} exceeds maxIterations ${node.iteration.maxIterations} for ${node.id}`,
+    };
+  }
+  if (previous.total !== undefined && previous.total !== total) {
+    return {
+      error: `Iteration count changed from ${previous.total} to ${total} for resumable node ${node.id}`,
+    };
+  }
+  const nextIndex = Number(previous.nextIndex ?? 0);
+  if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex > total) {
+    return { error: `Invalid saved nextIndex for ${node.id}` };
+  }
+  return { total, items, nextIndex, previous };
+}
+
+function iterationContext(node, run, descriptor, index, explicitValues, routeId = '') {
+  const savedItem = descriptor.previous.items?.[String(index)];
+  const item = savedItem ?? createIterationItem(
+    node,
+    run,
+    index,
+    descriptor.total,
+    descriptor.items?.[index],
+    explicitValues,
+    routeId,
+  );
+  const loop = {
+    index,
+    iteration: index + 1,
+    count: descriptor.total,
+    item,
+  };
+  const aliases = {};
+  setPath(aliases, node.iteration.indexAs, index);
+  setPath(aliases, node.iteration.itemAs, item);
+  return {
+    item,
+    values: { loop, ...aliases },
+    assignments: flattenAssignments({ loop, ...aliases }),
+  };
+}
+
 async function loadRun(runId) {
   const path = join(RUNS_ROOT, runId, 'state.json');
   if (!existsSync(path)) throw new Error(`Run not found: ${runId}`);
@@ -219,6 +411,80 @@ async function writeAndCommit(runId, payload) {
   const file = join(RUNS_ROOT, runId, 'last-boundary.json');
   await atomicWriteJson(file, payload);
   await commitBoundary(runId, `.workflow-runs/${runId}/last-boundary.json`);
+}
+
+async function prepareIterationCommit(runId, node, descriptor, context, result) {
+  const commitPath = resolve(ROOT, result.commitFile);
+  const payload = await readJson(commitPath);
+  const succeeded = result.status === 'success';
+  const finalIteration = succeeded && context.values.loop.index + 1 >= descriptor.total;
+  const previousResults = descriptor.previous.results ?? [];
+  const iterationResult = {
+    index: context.values.loop.index,
+    iteration: context.values.loop.iteration,
+    status: result.status,
+    batchId: result.batchId ?? '',
+    routeId: result.routeId ?? '',
+    extracted: result.extracted ?? {},
+    at: new Date().toISOString(),
+  };
+  payload.step.status = succeeded
+    ? finalIteration ? 'completed' : 'in_progress'
+    : 'blocked';
+  payload.step.note = succeeded
+    ? `Iteration ${context.values.loop.iteration}/${descriptor.total} completed`
+    : `Iteration ${context.values.loop.iteration}/${descriptor.total} failed: ${result.reason}`;
+  payload.loop = {
+    nodeId: node.id,
+    mode: node.iteration.mode,
+    total: descriptor.total,
+    nextIndex: succeeded ? context.values.loop.index + 1 : context.values.loop.index,
+    completedCount: succeeded ? context.values.loop.index + 1 : context.values.loop.index,
+    status: succeeded ? finalIteration ? 'completed' : 'active' : 'failed',
+    attemptingIndex: null,
+    items: {
+      ...(descriptor.previous.items ?? {}),
+      [String(context.values.loop.index)]: context.item,
+    },
+    results: [
+      ...previousResults.filter((item) => item.index !== context.values.loop.index),
+      iterationResult,
+    ].sort((left, right) => left.index - right.index),
+  };
+  payload.evidence ??= [];
+  payload.evidence.push({
+    kind: 'iteration',
+    value: `${node.id}#${context.values.loop.iteration}`,
+    note: JSON.stringify({
+      item: context.item,
+      status: result.status,
+      batchId: result.batchId ?? '',
+      extracted: result.extracted ?? {},
+    }),
+  });
+  await atomicWriteJson(commitPath, payload);
+  return payload.loop;
+}
+
+async function markIterationAttempt(runId, node, descriptor, context) {
+  await writeAndCommit(runId, {
+    ...localBoundary(node, null, 'in_progress'),
+    runStatus: 'active',
+    loop: {
+      nodeId: node.id,
+      mode: node.iteration.mode,
+      total: descriptor.total,
+      nextIndex: context.values.loop.index,
+      completedCount: context.values.loop.index,
+      status: 'attempting',
+      attemptingIndex: context.values.loop.index,
+      items: {
+        ...(descriptor.previous.items ?? {}),
+        [String(context.values.loop.index)]: context.item,
+      },
+      results: descriptor.previous.results ?? [],
+    },
+  });
 }
 
 function hasValidAuthorization(run, nodeId) {
@@ -326,6 +592,7 @@ async function main() {
   const segmentStarted = Date.now();
   const flags = parseArgs(process.argv.slice(2));
   if (flags.help) usage();
+  await assertCacheHygiene();
   const runId = safeRunId(one(flags, 'run'));
   const from = one(flags, 'from', false);
   if (from) safeName(from, 'from node id');
@@ -454,7 +721,82 @@ async function main() {
       return;
     }
 
-    const resolution = resolveWorkflowRecipe(definition, transactionValues(run, explicitValues), node.id);
+    const loopDescriptor = iterationDescriptor(node, run, explicitValues);
+    if (loopDescriptor?.error) {
+      if (!dryRun) {
+        await writeAndCommit(runId, {
+          ...localBoundary(node, null, 'blocked'),
+          runStatus: 'repair_required',
+        });
+      }
+      console.log(JSON.stringify({
+        status: 'repair-required',
+        runId,
+        executed,
+        skipped,
+        failedNode: node.id,
+        failure: { reason: loopDescriptor.error },
+        resume: { from: node.id },
+      }, null, 2));
+      process.exitCode = 2;
+      return;
+    }
+    if (loopDescriptor
+      && authorizationEnvelope.count !== null
+      && authorizationEnvelope.count !== loopDescriptor.total) {
+      const reason = `Iteration count ${loopDescriptor.total} does not match authorized count ${authorizationEnvelope.count} for ${node.id}`;
+      if (!dryRun) {
+        await writeAndCommit(runId, {
+          ...localBoundary(node, null, 'blocked'),
+          runStatus: 'repair_required',
+        });
+      }
+      console.log(JSON.stringify({
+        status: 'repair-required',
+        runId,
+        executed,
+        skipped,
+        failedNode: node.id,
+        failure: { reason },
+        resume: { from: node.id },
+      }, null, 2));
+      process.exitCode = 2;
+      return;
+    }
+    if (loopDescriptor && loopDescriptor.nextIndex === loopDescriptor.total) {
+      if (!dryRun) await writeAndCommit(runId, localBoundary(node, null));
+      executed.push({
+        nodeId: node.id,
+        type: node.type,
+        status: 'success',
+        mode: 'iteration-already-complete',
+        iterationCount: loopDescriptor.total,
+      });
+      continue;
+    }
+    const baseResolutionValues = transactionValues(run, explicitValues);
+    const baseResolution = resolveWorkflowRecipe(definition, baseResolutionValues, node.id);
+    const hasRouteGenerator = Object.keys(node.iteration?.generateByRoute ?? {}).length > 0;
+    const generationRouteId = hasRouteGenerator
+      && baseResolution.status === 'ready'
+      && baseResolution.resolved.length === 1
+      ? baseResolution.resolved[0].routeId
+      : '';
+    const firstIterationContext = loopDescriptor && (!hasRouteGenerator || generationRouteId)
+      ? iterationContext(
+          node,
+          run,
+          loopDescriptor,
+          loopDescriptor.nextIndex,
+          explicitValues,
+          generationRouteId,
+        )
+      : null;
+    const resolutionValues = mergeDeep({}, baseResolutionValues);
+    if (firstIterationContext) mergeDeep(resolutionValues, firstIterationContext.values);
+    const resolution = hasRouteGenerator && !generationRouteId
+      ? baseResolution
+      : resolveWorkflowRecipe(definition, resolutionValues, node.id);
     if (resolution.status !== 'ready' || resolution.resolved.length !== 1) {
       if (!dryRun) {
         await writeAndCommit(runId, {
@@ -495,6 +837,12 @@ async function main() {
         actionCount: selectedRoute.actions.length,
         authorizationMode: authorizationMode(node),
         authorizedCount: authorizationEnvelope.count,
+        iteration: loopDescriptor ? {
+          mode: node.iteration.mode,
+          total: loopDescriptor.total,
+          nextIndex: loopDescriptor.nextIndex,
+          generationRouteId: generationRouteId || null,
+        } : null,
         mode: 'dry-run',
       });
       continue;
@@ -548,75 +896,157 @@ async function main() {
       throw new Error(`Unsupported executable node type: ${node.type}`);
     }
 
-    let result;
-    let executionError = null;
-    let attempts = 0;
-    do {
-      attempts += 1;
-      executionError = null;
-      try {
-        result = await executeNode(runId, node.id, explicitAssignments);
-      } catch (error) {
-        executionError = error;
+    const iterationExecutions = [];
+    const indexes = loopDescriptor
+      ? Array.from(
+          { length: loopDescriptor.total - loopDescriptor.nextIndex },
+          (_, offset) => loopDescriptor.nextIndex + offset,
+        )
+      : [null];
+    for (const index of indexes) {
+      const currentRun = index === null ? run : await loadRun(runId);
+      const context = index === null
+        ? null
+        : iterationContext(
+            node,
+            currentRun,
+            loopDescriptor,
+            index,
+            explicitValues,
+            generationRouteId || selectedRoute.routeId,
+          );
+      if (context && node.risk === 'irreversible') {
+        await markIterationAttempt(runId, node, loopDescriptor, context);
       }
-      const reason = executionError?.message ?? result?.reason ?? '';
-      if ((!executionError && result?.status === 'success') || attempts > retries || !isTransientFailure(reason)) {
-        break;
+      const assignments = [
+        ...explicitAssignments,
+        ...(context?.assignments ?? []),
+      ];
+      let result;
+      let executionError = null;
+      let attempts = 0;
+      const automaticRetries = node.risk === 'irreversible' ? 0 : retries;
+      do {
+        attempts += 1;
+        executionError = null;
+        try {
+          result = await executeNode(runId, node.id, assignments);
+        } catch (error) {
+          executionError = error;
+        }
+        const reason = executionError?.message ?? result?.reason ?? '';
+        if ((!executionError && result?.status === 'success')
+          || attempts > automaticRetries
+          || !isTransientFailure(reason)) {
+          break;
+        }
+      } while (true);
+      if (executionError) {
+        await writeAndCommit(runId, {
+          ...localBoundary(node, selectedRoute, 'blocked'),
+          runStatus: 'repair_required',
+          telemetry: {
+            kind: 'transaction',
+            batchId: `crash-${node.id}-${Date.now()}`,
+            nodeId: node.id,
+            routeId: selectedRoute.routeId,
+            startedAt: segmentStartedAt,
+            endedAt: new Date().toISOString(),
+            durationMs: Date.now() - segmentStarted,
+            status: 'failure',
+          },
+        });
+        if (iterationExecutions.length > 0) {
+          executed.push({
+            nodeId: node.id,
+            type: node.type,
+            status: 'partial',
+            iterationCount: loopDescriptor?.total ?? 1,
+            completedIterations: iterationExecutions.length,
+            iterations: iterationExecutions,
+          });
+        }
+        console.log(JSON.stringify({
+          status: 'repair-required',
+          runId,
+          executed,
+          skipped,
+          failedNode: node.id,
+          failedIteration: context?.values.loop.iteration ?? null,
+          failure: { reason: executionError.message, completedActions: [], attempts },
+          resume: { from: node.id },
+        }, null, 2));
+        process.exitCode = 2;
+        return;
       }
-    } while (true);
-    if (executionError) {
-      await writeAndCommit(runId, {
-        ...localBoundary(node, selectedRoute, 'blocked'),
-        runStatus: 'repair_required',
-        telemetry: {
-          kind: 'transaction',
-          batchId: `crash-${node.id}-${Date.now()}`,
-          nodeId: node.id,
-          routeId: selectedRoute.routeId,
-          startedAt: segmentStartedAt,
-          endedAt: new Date().toISOString(),
-          durationMs: Date.now() - segmentStarted,
-          status: 'failure',
-        },
+      if (context) {
+        loopDescriptor.previous = await prepareIterationCommit(
+          runId,
+          node,
+          loopDescriptor,
+          context,
+          result,
+        );
+      }
+      await commitBoundary(runId, result.commitFile);
+      iterationExecutions.push({
+        index,
+        iteration: context?.values.loop.iteration ?? null,
+        routeId: result.routeId,
+        batchId: result.batchId,
+        status: result.status,
+        actionCount: result.results?.length ?? 0,
+        attempts,
       });
-      console.log(JSON.stringify({
-        status: 'repair-required',
-        runId,
-        executed,
-        skipped,
-        failedNode: node.id,
-        failure: { reason: executionError.message, completedActions: [], attempts },
-        resume: { from: node.id },
-      }, null, 2));
-      process.exitCode = 2;
-      return;
+      if (result.status !== 'success') {
+        executed.push({
+          nodeId: node.id,
+          type: node.type,
+          status: 'partial',
+          iterationCount: loopDescriptor?.total ?? 1,
+          completedIterations: iterationExecutions.filter((item) => item.status === 'success').length,
+          iterations: iterationExecutions,
+        });
+        console.log(JSON.stringify({
+          status: 'repair-required',
+          runId,
+          executed,
+          skipped,
+          failedNode: node.id,
+          failedIteration: context?.values.loop.iteration ?? null,
+          failure: {
+            reason: result.reason,
+            url: result.url,
+            completedActions: result.results,
+          },
+          resume: { from: node.id },
+        }, null, 2));
+        process.exitCode = 2;
+        return;
+      }
     }
-    executed.push({
-      nodeId: node.id,
-      type: node.type,
-      routeId: result.routeId,
-      batchId: result.batchId,
-      status: result.status,
-      actionCount: result.results?.length ?? 0,
-      attempts,
-    });
-    await commitBoundary(runId, result.commitFile);
-    if (result.status !== 'success') {
-      console.log(JSON.stringify({
-        status: 'repair-required',
-        runId,
-        executed,
-        skipped,
-        failedNode: node.id,
-        failure: {
-          reason: result.reason,
-          url: result.url,
-          completedActions: result.results,
-        },
-        resume: { from: node.id },
-      }, null, 2));
-      process.exitCode = 2;
-      return;
+    if (loopDescriptor) {
+      executed.push({
+        nodeId: node.id,
+        type: node.type,
+        status: 'success',
+        iterationMode: node.iteration.mode,
+        iterationCount: loopDescriptor.total,
+        completedIterations: iterationExecutions.length,
+        resumedFromIndex: loopDescriptor.nextIndex,
+        iterations: iterationExecutions,
+      });
+    } else {
+      const [execution] = iterationExecutions;
+      executed.push({
+        nodeId: node.id,
+        type: node.type,
+        routeId: execution.routeId,
+        batchId: execution.batchId,
+        status: execution.status,
+        actionCount: execution.actionCount,
+        attempts: execution.attempts,
+      });
     }
   }
 
