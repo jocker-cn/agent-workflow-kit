@@ -201,6 +201,28 @@ function deterministicNumber(seed) {
   return createHash('sha256').update(seed).digest().readUInt32BE(0) / 0x100000000;
 }
 
+function mergeGeneratorSpec(base, override) {
+  const merged = structuredClone(base ?? {});
+  for (const [key, value] of Object.entries(override ?? {})) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      merged[key] = mergeGeneratorSpec(merged[key], value);
+    } else {
+      merged[key] = structuredClone(value);
+    }
+  }
+  return merged;
+}
+
+function deterministicPermutation(values, seed, cycle = 0) {
+  return values
+    .map((value, index) => ({
+      value,
+      score: deterministicNumber(`${seed}\0cycle=${cycle}\0candidate=${index}`),
+    }))
+    .sort((left, right) => left.score - right.score)
+    .map(({ value }) => value);
+}
+
 function renderTemplate(template, values) {
   return String(template ?? '').replace(/\$\{([^}]+)\}/g, (_, key) => {
     const value = nestedValue(values, key);
@@ -213,7 +235,7 @@ function renderTemplate(template, values) {
   });
 }
 
-function generatedValue(spec, values, seed) {
+function generatedValue(spec, values, seed, { index = 0, total = 1 } = {}) {
   if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) return spec;
   switch (spec.op ?? 'literal') {
     case 'literal':
@@ -235,13 +257,33 @@ function generatedValue(spec, values, seed) {
       if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
         throw new Error('random-int requires integer min and max with max >= min');
       }
-      return min + Math.floor(deterministicNumber(seed) * (max - min + 1));
+      return min + Math.floor(deterministicNumber(`${seed}\0index=${index}`) * (max - min + 1));
     }
     case 'choice': {
       if (!Array.isArray(spec.values) || spec.values.length === 0) {
         throw new Error('choice requires a non-empty values array');
       }
-      return spec.values[Math.floor(deterministicNumber(seed) * spec.values.length)];
+      const selection = spec.selection ?? 'random';
+      let value;
+      if (selection === 'random') {
+        value = spec.values[
+          Math.floor(deterministicNumber(`${seed}\0index=${index}`) * spec.values.length)
+        ];
+      } else if (selection === 'cycle') {
+        value = spec.values[index % spec.values.length];
+      } else if (['balanced', 'shuffle-cycle', 'unique'].includes(selection)) {
+        if (selection === 'unique' && total > spec.values.length) {
+          throw new Error(
+            `unique choice requires at least ${total} values, received ${spec.values.length}`,
+          );
+        }
+        const cycle = Math.floor(index / spec.values.length);
+        const permutation = deterministicPermutation(spec.values, seed, cycle);
+        value = permutation[index % permutation.length];
+      } else {
+        throw new Error(`Unsupported choice selection: ${selection}`);
+      }
+      return structuredClone(value);
     }
     case 'random-string': {
       const length = Number(spec.length);
@@ -250,7 +292,9 @@ function generatedValue(spec, values, seed) {
         throw new Error('random-string requires positive length and a non-empty alphabet');
       }
       return Array.from({ length }, (_, offset) => (
-        alphabet[Math.floor(deterministicNumber(`${seed}\0${offset}`) * alphabet.length)]
+        alphabet[Math.floor(
+          deterministicNumber(`${seed}\0index=${index}\0offset=${offset}`) * alphabet.length,
+        )]
       )).join('');
     }
     default:
@@ -270,6 +314,8 @@ function createIterationItem(node, run, index, total, sourceItem, explicitValues
   setPath(values, node.iteration.indexAs, index);
   setPath(values, node.iteration.itemAs, item);
   const routeGenerator = routeId ? node.iteration.generateByRoute?.[routeId] ?? {} : {};
+  const fieldPolicies = run.generationProfile?.effective
+    ?.nodes?.[node.id]?.routes?.[routeId]?.fields ?? {};
   const generator = {
     ...(node.iteration.generate ?? {}),
     ...routeGenerator,
@@ -278,11 +324,12 @@ function createIterationItem(node, run, index, total, sourceItem, explicitValues
   let lastMissing = null;
   while (pending.size > 0) {
     let generated = 0;
-    for (const [key, spec] of pending) {
-      const seed = `${run.runId}\0${node.id}\0${index}\0${key}`;
+    for (const [key, baseSpec] of pending) {
+      const spec = mergeGeneratorSpec(baseSpec, fieldPolicies[key]);
+      const seed = `${run.runId}\0${node.id}\0${routeId}\0${key}`;
       let value;
       try {
-        value = generatedValue(spec, values, seed);
+        value = generatedValue(spec, values, seed, { index, total });
       } catch (error) {
         if (error.code === 'ITERATION_VALUE_MISSING') {
           lastMissing = error;
@@ -304,6 +351,100 @@ function createIterationItem(node, run, index, total, sourceItem, explicitValues
     }
   }
   return item;
+}
+
+function fieldValue(item, key) {
+  return key.split('.').reduce((value, part) => value?.[part], item);
+}
+
+function validateMaterializedItems(node, run, routeId, items, total) {
+  const policies = run.generationProfile?.effective
+    ?.nodes?.[node.id]?.routes?.[routeId]?.fields ?? {};
+  for (const [field, policy] of Object.entries(policies)) {
+    if (!policy?.unique) continue;
+    const values = Array.from({ length: total }, (_, index) => fieldValue(items[String(index)], field));
+    if (values.some((value) => value === undefined)) {
+      throw new Error(`Unique generation field is missing: ${node.id}/${routeId}/${field}`);
+    }
+    if (new Set(values.map((value) => JSON.stringify(value))).size !== total) {
+      throw new Error(`Generation field must be unique: ${node.id}/${routeId}/${field}`);
+    }
+  }
+}
+
+function materializedItems(node, run, descriptor, explicitValues, routeId) {
+  if (
+    descriptor.previous.routeId
+    && descriptor.previous.routeId !== routeId
+    && Object.keys(descriptor.previous.items ?? {}).length > 0
+  ) {
+    throw new Error(
+      `Iteration route changed for ${node.id}: ${descriptor.previous.routeId} -> ${routeId}`,
+    );
+  }
+  if (
+    descriptor.previous.total !== undefined
+    && descriptor.previous.total !== descriptor.total
+    && Object.keys(descriptor.previous.items ?? {}).length > 0
+  ) {
+    throw new Error(
+      `Iteration count changed for ${node.id}: ${descriptor.previous.total} -> ${descriptor.total}`,
+    );
+  }
+  const items = structuredClone(descriptor.previous.items ?? {});
+  for (let index = 0; index < descriptor.total; index += 1) {
+    if (items[String(index)] !== undefined) continue;
+    items[String(index)] = createIterationItem(
+      node,
+      run,
+      index,
+      descriptor.total,
+      descriptor.items?.[index],
+      explicitValues,
+      routeId,
+    );
+  }
+  validateMaterializedItems(node, run, routeId, items, descriptor.total);
+  return items;
+}
+
+function loopSummary(node, run, routeId, items, results, total) {
+  const policies = run.generationProfile?.effective
+    ?.nodes?.[node.id]?.routes?.[routeId]?.fields ?? {};
+  const fields = Object.keys(policies).length > 0
+    ? Object.keys(policies)
+    : [...new Set(Object.values(items).flatMap((item) => Object.keys(item ?? {})))];
+  const distinct = {};
+  const distribution = {};
+  const policySatisfied = {};
+  for (const field of fields) {
+    const values = Array.from({ length: total }, (_, index) => fieldValue(items[String(index)], field))
+      .filter((value) => value !== undefined && (value === null || typeof value !== 'object'));
+    if (values.length === 0) continue;
+    const counts = {};
+    for (const value of values) counts[String(value)] = (counts[String(value)] ?? 0) + 1;
+    distinct[field] = Object.keys(counts).length;
+    distribution[field] = counts;
+    const policy = policies[field] ?? {};
+    if (policy.unique) policySatisfied[`${field}.unique`] = distinct[field] === total;
+    if (['balanced', 'shuffle-cycle', 'cycle'].includes(policy.selection)) {
+      const frequencies = Object.values(counts);
+      policySatisfied[`${field}.${policy.selection}`] = (
+        Math.max(...frequencies) - Math.min(...frequencies) <= 1
+      );
+    }
+  }
+  return {
+    nodeId: node.id,
+    routeId,
+    requestedCount: total,
+    completedCount: results.filter((item) => item.status === 'success').length,
+    failedCount: results.filter((item) => item.status !== 'success').length,
+    durationMs: results.reduce((sum, item) => sum + Number(item.durationMs ?? 0), 0),
+    distinct,
+    distribution,
+    policySatisfied,
+  };
 }
 
 function iterationDescriptor(node, run, explicitValues) {
@@ -413,6 +554,42 @@ async function writeAndCommit(runId, payload) {
   await commitBoundary(runId, `.workflow-runs/${runId}/last-boundary.json`);
 }
 
+async function prepareIterationBatch(
+  runId,
+  node,
+  run,
+  descriptor,
+  explicitValues,
+  routeId,
+  persist = true,
+) {
+  const items = materializedItems(node, run, descriptor, explicitValues, routeId);
+  const prepared = {
+    ...(descriptor.previous ?? {}),
+    nodeId: node.id,
+    mode: node.iteration.mode,
+    total: descriptor.total,
+    nextIndex: descriptor.nextIndex,
+    completedCount: descriptor.nextIndex,
+    status: descriptor.nextIndex === descriptor.total ? 'completed' : 'prepared',
+    attemptingIndex: null,
+    routeId,
+    profileRevision: run.generationProfile?.baseRevision ?? null,
+    items,
+    results: descriptor.previous.results ?? [],
+    preparedAt: descriptor.previous.preparedAt ?? new Date().toISOString(),
+  };
+  if (persist) {
+    await writeAndCommit(runId, {
+      ...localBoundary(node, null, 'in_progress'),
+      runStatus: 'active',
+      loop: prepared,
+    });
+  }
+  descriptor.previous = prepared;
+  return prepared;
+}
+
 async function prepareIterationCommit(runId, node, descriptor, context, result) {
   const commitPath = resolve(ROOT, result.commitFile);
   const payload = await readJson(commitPath);
@@ -425,7 +602,11 @@ async function prepareIterationCommit(runId, node, descriptor, context, result) 
     status: result.status,
     batchId: result.batchId ?? '',
     routeId: result.routeId ?? '',
-    extracted: result.extracted ?? {},
+    observations: result.extracted ?? {},
+    boundaryEvidence: result.boundaryEvidence ?? null,
+    url: result.url ?? '',
+    actionCount: result.results?.length ?? 0,
+    durationMs: Number(result.durationMs ?? 0),
     at: new Date().toISOString(),
   };
   payload.step.status = succeeded
@@ -442,6 +623,9 @@ async function prepareIterationCommit(runId, node, descriptor, context, result) 
     completedCount: succeeded ? context.values.loop.index + 1 : context.values.loop.index,
     status: succeeded ? finalIteration ? 'completed' : 'active' : 'failed',
     attemptingIndex: null,
+    routeId: result.routeId ?? descriptor.previous.routeId ?? '',
+    profileRevision: descriptor.previous.profileRevision ?? null,
+    preparedAt: descriptor.previous.preparedAt ?? null,
     items: {
       ...(descriptor.previous.items ?? {}),
       [String(context.values.loop.index)]: context.item,
@@ -451,16 +635,36 @@ async function prepareIterationCommit(runId, node, descriptor, context, result) 
       iterationResult,
     ].sort((left, right) => left.index - right.index),
   };
-  payload.evidence ??= [];
+  if (finalIteration) {
+    const summary = loopSummary(
+      node,
+      await loadRun(runId),
+      result.routeId ?? descriptor.previous.routeId ?? '',
+      payload.loop.items,
+      payload.loop.results,
+      descriptor.total,
+    );
+    payload.loop.summary = summary;
+    payload.outputs ??= [];
+    payload.outputs.push({
+      key: `executionSummary.${node.id}`,
+      value: summary,
+    });
+  }
+  payload.evidence = (payload.evidence ?? [])
+    .filter((evidence) => evidence.kind !== 'transaction-boundary');
   payload.evidence.push({
     kind: 'iteration',
     value: `${node.id}#${context.values.loop.iteration}`,
-    note: JSON.stringify({
+    data: {
       item: context.item,
       status: result.status,
       batchId: result.batchId ?? '',
-      extracted: result.extracted ?? {},
-    }),
+      observations: result.extracted ?? {},
+      boundaryEvidence: result.boundaryEvidence ?? null,
+      url: result.url ?? '',
+      durationMs: Number(result.durationMs ?? 0),
+    },
   });
   await atomicWriteJson(commitPath, payload);
   return payload.loop;
@@ -478,6 +682,9 @@ async function markIterationAttempt(runId, node, descriptor, context) {
       completedCount: context.values.loop.index,
       status: 'attempting',
       attemptingIndex: context.values.loop.index,
+      routeId: descriptor.previous.routeId ?? '',
+      profileRevision: descriptor.previous.profileRevision ?? null,
+      preparedAt: descriptor.previous.preparedAt ?? null,
       items: {
         ...(descriptor.previous.items ?? {}),
         [String(context.values.loop.index)]: context.item,
@@ -828,6 +1035,17 @@ async function main() {
       return;
     }
     const selectedRoute = resolution.resolved[0];
+    if (loopDescriptor) {
+      await prepareIterationBatch(
+        runId,
+        node,
+        run,
+        loopDescriptor,
+        explicitValues,
+        generationRouteId || selectedRoute.routeId,
+        !dryRun,
+      );
+    }
 
     if (dryRun) {
       executed.push({
@@ -842,6 +1060,7 @@ async function main() {
           total: loopDescriptor.total,
           nextIndex: loopDescriptor.nextIndex,
           generationRouteId: generationRouteId || null,
+          materializedCount: Object.keys(loopDescriptor.previous.items ?? {}).length,
         } : null,
         mode: 'dry-run',
       });
@@ -853,6 +1072,20 @@ async function main() {
       const computed = localComputationPayload(node, run, explicitValues);
       payload.facts = computed.facts;
       payload.outputs = computed.outputs;
+      if (node.type === 'report' && node.reportFromLoop) {
+        const summary = run.data?.executionSummary?.[node.reportFromLoop]
+          ?? run.loops?.[node.reportFromLoop]?.summary;
+        if (!summary) {
+          throw new Error(
+            `Report ${node.id} requires completed loop summary ${node.reportFromLoop}`,
+          );
+        }
+        payload.outputs.push({
+          key: `reports.${node.id}`,
+          value: structuredClone(summary),
+        });
+        setPath(computed.values, `reports.${node.id}`, structuredClone(summary));
+      }
       if (node.type === 'decision') {
         payload.decisions = [{
           name: node.id,

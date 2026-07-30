@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'node:fs';
-import { readFile, rm } from 'node:fs/promises';
+import { readFile, readdir, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   CACHE_ROOT,
@@ -48,6 +48,7 @@ Commands:
   prepare [--prompt <file> | --prompt-key <key>]
   status [--prompt <file> | --prompt-key <key>]
   show [--prompt <file> | --prompt-key <key>]
+  profile-show [--prompt <file> | --prompt-key <key>]
   recipe-show [prompt selection]
   recipe-node [prompt selection] --id <node-id> --title <text>
               [--description <text>] [--node-class <browser|decision|human|report>]
@@ -85,7 +86,8 @@ Commands:
                 [--variant <variant-id>] [--reason <text>] [timing fields]
   action-result-batch [prompt selection] --file <project-relative-json>
   page-invalidate [prompt selection] --page <page-id> [--variant <variant-id>] --reason <text>
-  clear [prompt selection] [--scope <current|pages|workflow|drafts>] [--apply <true|false>]
+  clear [prompt selection]
+        [--scope <current|pages|profile|workflow|drafts|orphans>] [--apply <true|false>]
 
 Prompt selection is --prompt <path> or the shell-safe --prompt-key <key>. If the workspace has
 exactly one Prompt file, selection can be omitted.
@@ -97,9 +99,11 @@ Workflow recipes contain reusable nodes and locally guarded routes. Business ins
 as order.id stay in run state; only values that change the path belong in route --when guards.
 
 clear is preview-only unless --apply true is supplied. "current" removes the current definition
-version, "pages" removes reusable page caches, and "workflow" removes all definition versions and
-page caches belonging to the selected Prompt file. "drafts" removes non-canonical files anywhere
-under .workflow-cache and does not require Prompt selection.
+version, "pages" removes reusable page caches, "profile" removes remembered generation defaults,
+and "workflow" removes all definition versions, page caches, and defaults belonging to the selected
+Prompt file. "drafts" removes non-canonical files anywhere under .workflow-cache. "orphans"
+removes canonical Prompt-key directories whose Prompt file no longer exists. Neither requires
+Prompt selection.
 `);
   process.exit(exitCode);
 }
@@ -299,21 +303,54 @@ async function main() {
       console.log(JSON.stringify(result, null, 2));
       return;
     }
+    if (scope === 'orphans') {
+      const liveKeys = new Set((await listPromptIdentities()).map((identity) => identity.key));
+      const targets = [];
+      for (const area of ['definitions', 'pages', 'profiles']) {
+        const root = join(CACHE_ROOT, area);
+        if (!existsSync(root)) continue;
+        const entries = await readdir(root, { withFileTypes: true });
+        for (const entry of entries) {
+          if (
+            entry.isDirectory()
+            && /^prompt-[a-f0-9]{12}$/.test(entry.name)
+            && !liveKeys.has(entry.name)
+          ) {
+            targets.push(join(root, entry.name));
+          }
+        }
+      }
+      const result = {
+        status: apply ? 'cleared' : 'preview',
+        scope,
+        targets: targets
+          .map((target) => relative(ROOT, target).replaceAll('\\', '/'))
+          .sort(),
+      };
+      if (apply) {
+        await Promise.all(targets.map((target) => rm(target, { recursive: true, force: true })));
+      }
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
     const identity = await resolvePromptSelection({
       prompt: one(flags, 'prompt', false),
       promptKey: one(flags, 'prompt-key', false),
     });
     const paths = cachePaths(identity);
-    if (!['current', 'pages', 'workflow'].includes(scope)) {
-      throw new Error('--scope must be current, pages, workflow, or drafts');
+    if (!['current', 'pages', 'profile', 'workflow'].includes(scope)) {
+      throw new Error('--scope must be current, pages, profile, workflow, drafts, or orphans');
     }
     const definitionRoot = dirname(paths.definitionPath);
     const pagesRoot = join(CACHE_ROOT, 'pages', identity.key);
+    const profileRoot = dirname(paths.profilePath);
     const targets = scope === 'current'
       ? [paths.definitionPath]
       : scope === 'pages'
         ? [pagesRoot]
-        : [definitionRoot, pagesRoot];
+        : scope === 'profile'
+          ? [profileRoot]
+          : [definitionRoot, pagesRoot, profileRoot];
     for (const target of targets) {
       const relativeTarget = relative(CACHE_ROOT, resolve(target));
       if (relativeTarget.startsWith('..') || isAbsolute(relativeTarget) || relativeTarget === '') {
@@ -340,12 +377,14 @@ async function main() {
 
   if (command === 'prepare' || command === 'status') {
     const definition = await readJson(paths.definitionPath);
+    const profile = await readJson(paths.profilePath);
     const hygieneViolations = await cacheHygieneViolations();
     console.log(JSON.stringify({
       prompt: identity,
       cache: cacheDisplayPaths(paths),
       compilerStatus: compilationStatus(definition),
       recipeVersion: normalizeDefinition(definition).compiled.version,
+      profileRevision: profile.revision ?? 1,
       cacheHygiene: hygieneViolations.length === 0 ? 'clean' : 'invalid',
       hygieneViolations,
     }, null, 2));
@@ -359,7 +398,16 @@ async function main() {
       .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
       .map((entry) => entry.name.slice(0, -5))
       .sort();
-    console.log(JSON.stringify({ definition, pages }, null, 2));
+    console.log(JSON.stringify({
+      definition,
+      profile: await readJson(paths.profilePath),
+      pages,
+    }, null, 2));
+    return;
+  }
+
+  if (command === 'profile-show') {
+    console.log(JSON.stringify(await readJson(paths.profilePath), null, 2));
     return;
   }
 

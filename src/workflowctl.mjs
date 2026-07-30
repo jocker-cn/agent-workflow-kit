@@ -8,6 +8,9 @@ import {
   cacheDisplayPaths,
   ensurePromptCache,
   normalizeDefinition,
+  normalizeProfile,
+  promoteProfileOverrides,
+  readJson,
   resolvePromptSelection,
 } from './cache-store.mjs';
 
@@ -24,6 +27,8 @@ Commands:
   init --summary <text> [--intent <sanitized-workflow>]
        [--prompt-file <path> | --prompt-key <key>]
        [--workflow-name <name>] [--input key=value]... [--inputs-file <project-json>]
+       [--generation <node>.<route>.<field>.<setting>=<value>]...
+       [--remember-generation <true|false>]
   show --run <run-id>
   status --run <run-id>
   latest [--workflow-name <name>] [--input key=value]...
@@ -112,13 +117,58 @@ function parseInputs(values = []) {
   return inputs;
 }
 
+function parsedScalar(value) {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  if (value === 'null') return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+  return value;
+}
+
+function parseGenerationOverrides(values = []) {
+  const overrides = {};
+  for (const value of values) {
+    const separator = value.indexOf('=');
+    if (separator < 1) throw new Error('--generation must use key=value format');
+    const key = value.slice(0, separator);
+    const parts = key.split('.');
+    if (parts.length < 4) {
+      throw new Error('--generation must use node.route.field.setting=value');
+    }
+    const [nodeId, routeId, field, ...setting] = parts;
+    safeName(nodeId, 'generation node');
+    safeName(routeId, 'generation route');
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(field)) throw new Error('Invalid generation field');
+    setPath(
+      overrides,
+      `nodes.${nodeId}.routes.${routeId}.fields.${field}.${setting.join('.')}`,
+      parsedScalar(value.slice(separator + 1)),
+    );
+  }
+  return overrides;
+}
+
+function mergeProfile(target, source) {
+  for (const [key, value] of Object.entries(source ?? {})) {
+    if (value === null) {
+      delete target[key];
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      mergeProfile(target[key] ??= {}, value);
+      if (Object.keys(target[key]).length === 0) delete target[key];
+    } else {
+      target[key] = structuredClone(value);
+    }
+  }
+  return target;
+}
+
 function containsValues(target, expected) {
   if (expected === null || typeof expected !== 'object') return target === expected;
   return Object.entries(expected).every(([key, value]) => containsValues(target?.[key], value));
 }
 
 function normalizeRun(run) {
-  run.schemaVersion ??= 1;
+  run.schemaVersion = Math.max(Number(run.schemaVersion ?? 1), 3);
   run.name ??= run.workflow ?? 'prompt-workflow';
   run.intent ??= run.summary ?? '';
   run.prompt ??= null;
@@ -146,6 +196,13 @@ function normalizeRun(run) {
   };
   run.executionHistory ??= [];
   run.loops ??= {};
+  run.generationProfile ??= {
+    baseRevision: null,
+    overrides: {},
+    effective: {},
+    remember: false,
+    promotion: null,
+  };
   return run;
 }
 
@@ -216,8 +273,9 @@ function findStep(run, id) {
   return step;
 }
 
-async function addEvidence(runId, kind, value, note = '') {
+async function addEvidence(runId, kind, value, note = '', data = undefined) {
   const item = { at: new Date().toISOString(), kind, value, note };
+  if (data !== undefined) item.data = data;
   await appendFile(join(runDir(runId), 'evidence.jsonl'), `${JSON.stringify(item)}\n`, 'utf8');
   return item;
 }
@@ -384,16 +442,27 @@ async function main() {
     const promptFile = one(flags, 'prompt-file', false);
     const promptKey = one(flags, 'prompt-key', false);
     let prompt = null;
+    let profile = null;
     if (promptFile || promptKey) {
       const identity = await resolvePromptSelection({ prompt: promptFile, promptKey });
       const paths = await ensurePromptCache(identity);
       prompt = { ...identity, cache: cacheDisplayPaths(paths) };
+      profile = normalizeProfile(await readJson(paths.profilePath), identity);
     }
+    const generationOverrides = parseGenerationOverrides(flags.generation);
+    const rememberGeneration = one(flags, 'remember-generation', false) ?? 'true';
+    if (!['true', 'false'].includes(rememberGeneration)) {
+      throw new Error('--remember-generation must be true or false');
+    }
+    const effectiveGeneration = mergeProfile(
+      structuredClone(profile?.defaults ?? {}),
+      generationOverrides,
+    );
     const fileInputs = one(flags, 'inputs-file', false)
       ? await readProjectJson(one(flags, 'inputs-file', false))
       : {};
     const run = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       runId,
       name,
       summary,
@@ -430,6 +499,13 @@ async function main() {
       },
       executionHistory: [],
       loops: {},
+      generationProfile: {
+        baseRevision: profile?.revision ?? null,
+        overrides: generationOverrides,
+        effective: effectiveGeneration,
+        remember: rememberGeneration === 'true',
+        promotion: null,
+      },
     };
     await mkdir(runDir(runId), { recursive: true });
     await saveRun(run);
@@ -717,7 +793,13 @@ async function main() {
 
     for (const evidence of payload.evidence ?? []) {
       if (!evidence.kind || !evidence.value) throw new Error('Each evidence item requires kind and value');
-      const item = await addEvidence(runId, evidence.kind, evidence.value, evidence.note ?? '');
+      const item = await addEvidence(
+        runId,
+        evidence.kind,
+        evidence.value,
+        evidence.note ?? '',
+        evidence.data,
+      );
       run.evidenceCount += 1;
       run.evidenceSummary[evidence.kind] = (run.evidenceSummary[evidence.kind] ?? 0) + 1;
       run.evidenceRecent.push(item);
@@ -799,6 +881,19 @@ async function main() {
       throw new Error(`Cannot complete with unfinished steps: ${unfinished.map((step) => step.id).join(', ')}`);
     }
     run.status = 'completed';
+    if (
+      run.prompt?.key
+      && run.generationProfile?.remember
+      && Object.keys(run.generationProfile.overrides ?? {}).length > 0
+    ) {
+      const identity = await resolvePromptSelection({ promptKey: run.prompt.key });
+      await ensurePromptCache(identity);
+      run.generationProfile.promotion = await promoteProfileOverrides(identity, {
+        baseRevision: run.generationProfile.baseRevision,
+        overrides: run.generationProfile.overrides,
+        runId,
+      });
+    }
     run.cursor.nextAction = '';
     run.cursor.at = new Date().toISOString();
     await saveRun(run);

@@ -223,6 +223,11 @@ function normalizeTransaction(raw, index) {
   if (iteration && type !== 'browser') {
     throw new Error(`${id}.iteration is currently supported only for browser transactions`);
   }
+  const reportFromLoop = raw.reportFromLoop?.trim() || '';
+  if (reportFromLoop) {
+    if (type !== 'report') throw new Error(`${id}.reportFromLoop requires type report`);
+    safeName(reportFromLoop, `${id}.reportFromLoop`);
+  }
   if (iteration && Object.keys(iteration.generateByRoute).length > 0) {
     const preGenerationReferences = [
       ...unique(raw.requires),
@@ -264,8 +269,12 @@ function normalizeTransaction(raw, index) {
     collects: unique(raw.collects),
     asserts: normalizeAssertions(raw.asserts, `${id}.asserts`),
     computes: normalizeComputations(raw.computes, `${id}.computes`),
+    reportFromLoop,
     iteration,
-    after: unique(raw.after).map((value) => safeName(value, `${id}.after`)),
+    after: unique([
+      ...(raw.after ?? []),
+      ...(reportFromLoop ? [reportFromLoop] : []),
+    ]).map((value) => safeName(value, `${id}.after`)),
     barrier,
     risk,
     authorization,
@@ -277,7 +286,19 @@ function normalizeTransaction(raw, index) {
       writes: unique(operation.writes),
     })),
     dependsOn: unique(raw.dependsOn),
-    routes: Array.isArray(raw.routes) ? raw.routes : [],
+    routes: Array.isArray(raw.routes) && raw.routes.length > 0
+      ? raw.routes
+      : type === 'report'
+        ? [{
+            id: 'default',
+            when: {},
+            signature: 'default',
+            status: 'learned',
+            actions: [],
+            postcondition: '',
+            expectation: null,
+          }]
+        : [],
     sourceNodeIds: [id],
     sourceOrder: index,
   };
@@ -414,6 +435,20 @@ export function compileWorkflowSpec(spec) {
     if (ids.has(transaction.id)) throw new Error(`Duplicate transaction id: ${transaction.id}`);
     ids.add(transaction.id);
   }
+  for (const transaction of transactions) {
+    if (!transaction.reportFromLoop) continue;
+    const source = transactions.find((candidate) => candidate.id === transaction.reportFromLoop);
+    if (!source) {
+      throw new Error(
+        `${transaction.id}.reportFromLoop references unknown node ${transaction.reportFromLoop}`,
+      );
+    }
+    if (!source.iteration) {
+      throw new Error(
+        `${transaction.id}.reportFromLoop requires an iteration node: ${transaction.reportFromLoop}`,
+      );
+    }
+  }
   const dependencies = dependencyGraph(transactions, spec.constraints ?? []);
   const ordered = scheduleTransactions(transactions, dependencies);
   const nodes = canonicalizeFusedReferences(fuseTransactions(ordered)).map((node, index) => ({
@@ -427,6 +462,7 @@ export function compileWorkflowSpec(spec) {
     collects: node.collects,
     asserts: node.asserts,
     computes: node.computes,
+    reportFromLoop: node.reportFromLoop,
     iteration: node.iteration,
     dependsOn: node.dependsOn,
     after: node.after,
@@ -439,17 +475,33 @@ export function compileWorkflowSpec(spec) {
     routes: node.routes,
   }));
   const validationWarnings = nodes.flatMap((node) => {
+    const warnings = [];
     const supplied = new Set([
       ...node.collects,
       ...node.asserts.map((assertion) => assertion.key),
       ...node.computes.filter((computation) => computation.target === 'fact').map((computation) => computation.key),
     ]);
     const missing = node.produces.filter((key) => !supplied.has(key));
-    return missing.length === 0 ? [] : [{
-      nodeId: node.id,
-      reason: 'Declared produced facts have no collect, assert, or compute source',
-      facts: missing,
-    }];
+    if (missing.length > 0) {
+      warnings.push({
+        nodeId: node.id,
+        reason: 'Declared produced facts have no collect, assert, or compute source',
+        facts: missing,
+      });
+    }
+    if (
+      node.type === 'report'
+      && node.computes.length === 0
+      && !node.reportFromLoop
+      && node.authorization.mode !== 'runtime'
+      && node.risk === 'read'
+    ) {
+      warnings.push({
+        nodeId: node.id,
+        reason: 'Report has no computations or loop summary source and will not add output data',
+      });
+    }
+    return warnings;
   });
   return {
     workflow: {
@@ -612,7 +664,8 @@ async function main() {
     validationWarnings: compiled.validationWarnings,
     migrationWarnings,
     nodes: compiled.nodes.map(({
-      id, title, affinity, requires, produces, barrier, risk, authorization, iteration, sourceNodeIds,
+      id, title, affinity, requires, produces, barrier, risk, authorization, iteration,
+      reportFromLoop, sourceNodeIds,
     }) => ({
       id,
       title,
@@ -623,6 +676,7 @@ async function main() {
       risk,
       authorization,
       iteration,
+      reportFromLoop,
       sourceNodeIds,
     })),
   }, null, 2));

@@ -93,17 +93,20 @@ pnpm run workflow -- context --run <run-id>
 
 ## Prompt 专属缓存
 
-每个 Prompt 文件根据“文件身份 + 内容哈希”获得独立缓存。逻辑上分成两层：
+每个 Prompt 文件根据“文件身份 + 内容哈希”获得独立缓存。逻辑上分成三层：
 
 ```text
 .workflow-cache/
 ├── definitions/
 │   └── <prompt-key>/
 │       └── <prompt-hash>.json        参数化流程节点与条件路线
-└── pages/
+├── pages/
     └── <prompt-key>/
         └── shared/
             └── <page-id>.json        跨 Prompt 正文版本复用的页面动作
+└── profiles/
+    └── <prompt-key>/
+        └── defaults.json             成功运行后记住的字段生成偏好
 ```
 
 - 同一个 Prompt、不同订单或资源变量：共享缓存，run 相互隔离；
@@ -116,6 +119,12 @@ pnpm run workflow -- context --run <run-id>
 - 缓存由 Agent 自动生成和修复，用户只维护自然语言 Prompt；
 - snapshot ref、凭据、验证码和本次业务变量不会写入缓存。
 
+字段生成规则按三层解析：Workflow Definition 保存 Prompt 的稳定结构；Defaults Profile
+保存同一 Prompt 上次成功运行后可复用的字段偏好；Run Overlay 保存本次任务明确提出的变化。
+本次规则覆盖共享默认值，并在 run 创建时形成不可变快照。任务成功后默认回写本次变化；
+用户说明“仅本次”时使用 `--remember-generation false`，不会污染后续任务。Profile 有独立
+revision，因此不会改变 Recipe 版本，也不会把某次的 `num` 展开进缓存。
+
 首次执行时，Agent 在内存中生成内部编译输入。业务说明保存在 Workflow、事实、策略、事务和
 操作的 `description` 字段中；Skill 只保存所有业务共用的编译算法。编译输入通过 stdin
 直接传给编译器，不会在 `.workflow-cache` 中留下临时 JSON：
@@ -125,7 +134,7 @@ pnpm run workflow -- context --run <run-id>
 ```
 
 `--file <compiler-json>` 只用于诊断，并且文件必须位于 `.workflow-cache` 之外，编译后删除。
-Cache 只允许保存正式 Definition 和共享 Page Action；其他文件会被执行器拒绝。
+Cache 只允许保存正式 Definition、共享 Page Action 和 Defaults Profile；其他文件会被执行器拒绝。
 
 编译器不会机械保留 Prompt 的句子顺序。它保留明确的前后关系、事实依赖、人工边界和高风险
 操作，然后优先排列相同页面状态的任务，并融合兼容事务。之后 Agent 探索页面并学习局部路线
@@ -190,9 +199,20 @@ pnpm execute -- --run <run-id> --from <failed-node-id>
 - `iteration.generate` 只生成所有路线共用的字段；
 - `iteration.generateByRoute.<route-id>` 只生成当前业务路线需要的字段。
 
-Runner 在每轮不可逆提交前持久化实际 `loop.item`，成功后推进 `nextIndex`。恢复时复用已经保存
-的 item，不会重新随机生成；字段间的 `copy` 和模板引用也不依赖 JSON 属性书写顺序。价格范围、
-唯一性、候选项等业务规则只能来自 Prompt，框架不会自行添加。
+Runner 在第一轮不可逆提交前一次性生成、校验并持久化完整 batch，成功后逐轮推进
+`nextIndex`。恢复时复用已经保存的 item，不会重新随机生成；字段间的 `copy` 和模板引用也
+不依赖 JSON 属性书写顺序。价格范围、唯一性、候选项等业务规则只能来自 Prompt，框架不会
+自行添加。选择字段支持 `random`、`cycle`、`balanced`、`shuffle-cycle` 和 `unique`；
+循环完成后自动写入包含数量、耗时、字段分布和规则校验的 `executionSummary.<node-id>`。
+
+Agent 可在创建 run 时把本次自然语言中的字段规则映射为 Run Overlay，例如：
+
+```bash
+pnpm workflow init --summary "新增 20 个微信资源" --prompt-key <prompt-key> \
+  --input resourceType=微信资源 --input num=20 \
+  --generation submit-resources.weixin.authType.selection=balanced \
+  --generation submit-resources.weixin.name.unique=true
+```
 
 清理 Cache 时先预览准确目标：
 
@@ -203,11 +223,17 @@ pnpm cachectl clear --scope drafts
 # 删除预览出的非正式文件
 pnpm cachectl clear --scope drafts --apply true
 
+# 预览已经删除 Prompt 文件留下的正式 Cache 目录
+pnpm cachectl clear --scope orphans
+
 # 只清当前 Prompt 正文版本的 Definition
 pnpm cachectl clear --prompt-key <prompt-key> --scope current
 
-# 清理该 Prompt 文件的所有 Definition 版本和共享页面 Cache
+# 清理该 Prompt 文件的所有 Definition、共享页面 Cache 和字段默认值
 pnpm cachectl clear --prompt-key <prompt-key> --scope workflow
+
+# 只清理该 Prompt 记住的字段默认值
+pnpm cachectl clear --prompt-key <prompt-key> --scope profile
 
 # 确认预览无误后执行
 pnpm cachectl clear --prompt-key <prompt-key> --scope workflow --apply true

@@ -360,6 +360,15 @@ async function main() {
     }
     group.actions.push(selected);
   }
+  const boundaryDescriptor = selectedRoute.expectation.kind === 'action'
+    ? {
+        kind: 'action',
+        expected: `${selectedRoute.expectation.page}@${selectedRoute.expectation.variant ?? 'default'}/${selectedRoute.expectation.action}`,
+      }
+    : {
+        kind: selectedRoute.expectation.kind,
+        expected: selectedRoute.expectation.value,
+      };
 
   const lines = [
     'async page => {',
@@ -369,6 +378,7 @@ async function main() {
     '  const __extracted = {};',
     `  const __groups = ${JSON.stringify(actionGroups.map((group) => group.fingerprint))};`,
     `  const __transitionTimeoutMs = ${selectedRoute.transitionTimeoutMs};`,
+    `  const __boundaryDescriptor = ${JSON.stringify(boundaryDescriptor)};`,
     '  const __globRegex = value => new RegExp(`^${value.split("*").map(part => part.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")).join(".*")}$`);',
     '  const __switchPage = async (urlGlob, timeoutMs, tabRole) => {',
     '    const pattern = __globRegex(urlGlob);',
@@ -479,9 +489,10 @@ async function main() {
   }
   lines.push('    const __postStarted = Date.now();');
   lines.push(`    ${expectationCode(selectedRoute.expectation, actionLookup)};`);
-  lines.push("    return JSON.stringify({ status: 'success', results: __results, extracted: __extracted, startGroup: __startGroup, skippedGroupCount: __startGroup, postconditionDurationMs: Date.now() - __postStarted, url: __page.url() });");
+  lines.push('    const __boundaryEvidence = { ...__boundaryDescriptor, satisfied: true, checkedAt: new Date().toISOString(), durationMs: Date.now() - __postStarted, url: __page.url() };');
+  lines.push("    return JSON.stringify({ status: 'success', results: __results, extracted: __extracted, boundaryEvidence: __boundaryEvidence, startGroup: __startGroup, skippedGroupCount: __startGroup, postconditionDurationMs: __boundaryEvidence.durationMs, url: __page.url() });");
   lines.push('  } catch (error) {');
-  lines.push("    return JSON.stringify({ status: 'failure', results: __results, extracted: __extracted, reason: error.message, url: __page.url() });");
+  lines.push("    return JSON.stringify({ status: 'failure', results: __results, extracted: __extracted, boundaryEvidence: { ...__boundaryDescriptor, satisfied: false, checkedAt: new Date().toISOString(), durationMs: 0, url: __page.url(), reason: error.message }, reason: error.message, url: __page.url() });");
   lines.push('  }');
   lines.push('}');
   const script = `${lines.join('\n')}\n`;
@@ -552,6 +563,7 @@ async function main() {
     throw new Error(`Unexpected Playwright batch result: ${stdout.trim().slice(0, 1000)}`);
   }
   const finishedAt = new Date().toISOString();
+  const batchDurationMs = Date.now() - batchStarted;
   const resultsByAction = new Map(result.results.map((item) => [
     `${item.page}@${item.variant}/${item.name}`,
     item,
@@ -630,14 +642,27 @@ async function main() {
       routeId: selectedRoute.routeId,
       startedAt: batchStartedAt,
       endedAt: finishedAt,
-      durationMs: Date.now() - batchStarted,
+      durationMs: batchDurationMs,
       status: result.status,
     },
+    evidence: [{
+      kind: 'transaction-boundary',
+      value: `${nodeId}/${selectedRoute.routeId}`,
+      data: {
+        status: result.status,
+        batchId,
+        observations: result.extracted ?? {},
+        boundaryEvidence: result.boundaryEvidence ?? null,
+        url: result.url ?? '',
+        durationMs: batchDurationMs,
+      },
+    }],
   };
   const commitPath = join(RUNS_ROOT, runId, 'last-boundary.json');
   await atomicWriteJson(commitPath, commitPayload);
   console.log(JSON.stringify({
     ...result,
+    durationMs: batchDurationMs,
     batchId,
     recipeVersion: definition.compiled.version,
     nodeId,

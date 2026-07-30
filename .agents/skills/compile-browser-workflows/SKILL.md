@@ -48,6 +48,16 @@ the user to author nodes, selectors, YAML, or a business Skill.
    present in the Workflow Prompt.
    Never unroll a current `num` into numbered nodes or routes, and never create parameter-specific
    orchestration scripts.
+   Separate the three sources of generation behavior:
+   - the compiled generator is the Prompt's stable structural rule;
+   - the Prompt-scoped Defaults Profile remembers successful field preferences across runs;
+   - the Run Overlay contains explicit rules for the current task and wins over remembered
+     defaults.
+   Pass current-task rules at run creation with repeated
+   `--generation <node>.<route>.<field>.<setting>=<value>`. Use
+   `--remember-generation false` only when the user says the rule is temporary. The executor
+   snapshots the effective profile and materializes the complete batch before its first
+   irreversible write.
 7. For a same-route SPA mutation, insert one structured wait before dependent reads. Prefer a
    parameterized target that proves the requested business object is present, then require stable
    content for a short interval. Do not treat a prose postcondition as executable synchronization.
@@ -93,15 +103,22 @@ pnpm execute -- --run <run-id> --from <failed-node-id>
 ```
 
 Persist state at transaction boundaries, not after individual clicks or extracted fields.
-For iteration nodes, the executor records the item, result, and `nextIndex` after every iteration.
+For iteration nodes, the executor first persists all materialized items, then records the result
+and `nextIndex` after every iteration. Completion automatically stores
+`executionSummary.<node-id>` with counts, timing, distributions, and policy checks. Use
+`reportFromLoop` only when an explicit report transaction must expose that summary; do not compile
+an empty report transaction.
 Resume the same node; do not generate a recovery script or expand the remaining indexes.
 Automatic transient retries are limited to read or reversible nodes. An irreversible failure
 returns to the Agent for visible-result reconciliation before another execution is started.
 
 Treat `.workflow-cache` as strict canonical storage. The only valid files are compiled definitions
 under `definitions/<prompt-key>/<prompt-hash>.json` and shared page actions under
-`pages/<prompt-key>/shared/<page-id>.json`. Compiler drafts, root JSON, executables, and
-orchestration files are invalid even when temporary. Executor-created temporary Playwright files
-belong to the run directory and are removed automatically. Preview legacy cache drafts with
+`pages/<prompt-key>/shared/<page-id>.json`, plus remembered field defaults under
+`profiles/<prompt-key>/defaults.json`. Compiler drafts, root JSON, executables, and orchestration
+files are invalid even when temporary. Executor-created temporary Playwright files belong to the
+run directory and are removed automatically. Preview legacy cache drafts with
 `pnpm cachectl clear --scope drafts`; the preview includes non-canonical artifacts at any cache
 depth. Remove them with the same command plus `--apply true`.
+Preview canonical cache directories whose Prompt source file no longer exists with
+`pnpm cachectl clear --scope orphans`.

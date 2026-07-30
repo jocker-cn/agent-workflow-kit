@@ -240,8 +240,10 @@ test('definitions are versioned while page caches are reused only within one pro
       rm(promptBPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', preparedA.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', preparedA.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', preparedA.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'definitions', preparedB.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', preparedB.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', preparedB.prompt.key), { recursive: true, force: true }),
     ]);
   });
 
@@ -347,6 +349,7 @@ test('parameterized recipes isolate type A and B routes and stop on an unknown t
       rm(commitPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
 
@@ -565,6 +568,7 @@ test('workflow compiler accepts stdin without creating a cache draft', async (t)
       rm(promptPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
 
@@ -629,6 +633,7 @@ test('recipe guards normalize scalar values from workflow facts', async (t) => {
       rm(promptPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   cache(
@@ -666,11 +671,13 @@ test('cache clear previews exact targets and can clear pages or the complete pro
   const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
   const definitionsRoot = join(root, '.workflow-cache', 'definitions', prepared.prompt.key);
   const pagesRoot = join(root, '.workflow-cache', 'pages', prepared.prompt.key);
+  const profileRoot = join(root, '.workflow-cache', 'profiles', prepared.prompt.key);
   t.after(async () => {
     await Promise.all([
       rm(promptPath, { force: true }),
       rm(definitionsRoot, { recursive: true, force: true }),
       rm(pagesRoot, { recursive: true, force: true }),
+      rm(profileRoot, { recursive: true, force: true }),
     ]);
   });
   cache(
@@ -685,6 +692,7 @@ test('cache clear previews exact targets and can clear pages or the complete pro
   assert.equal(preview.status, 'preview');
   assert.equal(existsSync(definitionsRoot), true);
   assert.equal(existsSync(pagesRoot), true);
+  assert.equal(existsSync(profileRoot), true);
 
   const clearedPages = JSON.parse(cache(
     'clear', '--prompt-key', prepared.prompt.key,
@@ -699,6 +707,106 @@ test('cache clear previews exact targets and can clear pages or the complete pro
     '--scope', 'workflow', '--apply', 'true',
   );
   assert.equal(existsSync(definitionsRoot), false);
+  assert.equal(existsSync(profileRoot), false);
+});
+
+test('successful run overrides promote to a shared profile and remain overridable per run', async (t) => {
+  const suffix = `${process.pid}-${Date.now()}`;
+  const promptDir = join(root, '.github', 'prompts');
+  const promptPath = join(promptDir, `profile-${suffix}.prompt.md`);
+  const relativePrompt = `.github/prompts/profile-${suffix}.prompt.md`;
+  await mkdir(promptDir, { recursive: true });
+  await writeFile(promptPath, 'Submit generated resources with reusable field preferences.\n', 'utf8');
+  const prepared = JSON.parse(cache('prepare', '--prompt', relativePrompt));
+  const promptCacheRoots = ['definitions', 'pages', 'profiles']
+    .map((scope) => join(root, '.workflow-cache', scope, prepared.prompt.key));
+  const runIds = [];
+  t.after(async () => {
+    await Promise.all([
+      rm(promptPath, { force: true }),
+      ...promptCacheRoots.map((path) => rm(path, { recursive: true, force: true })),
+      ...runIds.map(removeRun),
+    ]);
+  });
+
+  const first = runId(run(
+    'init', '--summary', 'Remember balanced authentication types',
+    '--name', 'profile-test', '--prompt-key', prepared.prompt.key,
+    '--generation', 'submit-resources.weixin.authType.selection=balanced',
+    '--generation', 'submit-resources.weixin.name.unique=true',
+  ));
+  runIds.push(first);
+  const firstState = JSON.parse(run('show', '--run', first));
+  assert.equal(firstState.generationProfile.baseRevision, 1);
+  assert.equal(
+    firstState.generationProfile.effective
+      .nodes['submit-resources'].routes.weixin.fields.authType.selection,
+    'balanced',
+  );
+  run('complete', '--run', first);
+  const promoted = JSON.parse(cache('profile-show', '--prompt-key', prepared.prompt.key));
+  assert.equal(promoted.revision, 2);
+  assert.equal(
+    promoted.defaults.nodes['submit-resources'].routes.weixin.fields.name.unique,
+    true,
+  );
+
+  const inherited = runId(run(
+    'init', '--summary', 'Reuse remembered preferences',
+    '--name', 'profile-test', '--prompt-key', prepared.prompt.key,
+  ));
+  runIds.push(inherited);
+  assert.equal(
+    JSON.parse(run('show', '--run', inherited)).generationProfile.effective
+      .nodes['submit-resources'].routes.weixin.fields.authType.selection,
+    'balanced',
+  );
+
+  const temporary = runId(run(
+    'init', '--summary', 'Use a one-run selection strategy',
+    '--name', 'profile-test', '--prompt-key', prepared.prompt.key,
+    '--generation', 'submit-resources.weixin.authType.selection=cycle',
+    '--remember-generation', 'false',
+  ));
+  runIds.push(temporary);
+  assert.equal(
+    JSON.parse(run('show', '--run', temporary)).generationProfile.effective
+      .nodes['submit-resources'].routes.weixin.fields.authType.selection,
+    'cycle',
+  );
+  run('complete', '--run', temporary);
+  const unchanged = JSON.parse(cache('profile-show', '--prompt-key', prepared.prompt.key));
+  assert.equal(unchanged.revision, 2);
+  assert.equal(
+    unchanged.defaults.nodes['submit-resources'].routes.weixin.fields.authType.selection,
+    'balanced',
+  );
+
+  const concurrentA = runId(run(
+    'init', '--summary', 'Remember a new authentication strategy',
+    '--name', 'profile-test', '--prompt-key', prepared.prompt.key,
+    '--generation', 'submit-resources.weixin.authType.selection=cycle',
+  ));
+  const concurrentB = runId(run(
+    'init', '--summary', 'Remember a separate follower strategy',
+    '--name', 'profile-test', '--prompt-key', prepared.prompt.key,
+    '--generation', 'submit-resources.weixin.referenceFollowers.selection=shuffle-cycle',
+  ));
+  runIds.push(concurrentA, concurrentB);
+  run('complete', '--run', concurrentA);
+  run('complete', '--run', concurrentB);
+  const rebasedState = JSON.parse(run('show', '--run', concurrentB));
+  assert.equal(rebasedState.generationProfile.promotion.rebasedFromRevision, 2);
+  const merged = JSON.parse(cache('profile-show', '--prompt-key', prepared.prompt.key));
+  assert.equal(merged.revision, 4);
+  assert.equal(
+    merged.defaults.nodes['submit-resources'].routes.weixin.fields.authType.selection,
+    'cycle',
+  );
+  assert.equal(
+    merged.defaults.nodes['submit-resources'].routes.weixin.fields.referenceFollowers.selection,
+    'shuffle-cycle',
+  );
 });
 
 test('compiler safely merges learned routes when same-page transactions are fused', async (t) => {
@@ -717,6 +825,7 @@ test('compiler safely merges learned routes when same-page transactions are fuse
       rm(compilerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   cache(
@@ -810,6 +919,7 @@ test('continuous runner persists human boundaries then completes decision and re
       rm(compilerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   const defaultRoute = {
@@ -906,6 +1016,7 @@ test('continuous runner commits a failed browser transaction before returning re
       rm(fakeRunnerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   await writeFile(compilerPath, JSON.stringify({
@@ -983,6 +1094,7 @@ test('risk boundaries remain waiting until the exact node is confirmed', async (
       rm(compilerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   await writeFile(compilerPath, JSON.stringify({
@@ -1041,6 +1153,7 @@ test('a bounded write explicitly authorized by the Prompt does not pause for con
       rm(compilerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   await writeFile(compilerPath, JSON.stringify({
@@ -1116,6 +1229,7 @@ test('parameterized repeat keeps one node, persists generated items, and resumes
       rm(fakeRunnerPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   await writeFile(compilerPath, JSON.stringify({
@@ -1153,6 +1267,10 @@ test('parameterized repeat keeps one node, persists generated items, and resumes
           weibo: {
             name: { op: 'template', template: '${loop.item.prefix}-${loop.iteration}' },
             prefix: { op: 'literal', value: 'weibo-resource' },
+            authType: {
+              op: 'choice',
+              values: ['未认证', '个人认证', '企业认证'],
+            },
             weiboOnly: { op: 'literal', value: true },
           },
         },
@@ -1177,18 +1295,26 @@ test('parameterized repeat keeps one node, persists generated items, and resumes
           expectation: null,
         },
       ],
+    }, {
+      id: 'report-result',
+      title: 'Report batch result',
+      type: 'report',
+      reportFromLoop: 'submit-resources',
     }],
   }, null, 2), 'utf8');
   const compiled = JSON.parse(compile(
     '--prompt-key', prepared.prompt.key, '--file', relativeCompiler,
   ));
-  assert.equal(compiled.optimization.executableTransactionCount, 1);
+  assert.equal(compiled.optimization.executableTransactionCount, 2);
   assert.equal(compiled.nodes[0].iteration.countFrom, 'num');
+  assert.equal(compiled.nodes[1].reportFromLoop, 'submit-resources');
 
   id = runId(run(
     'init', '--summary', 'Submit three resources', '--name', 'repeat-test',
     '--prompt-key', prepared.prompt.key, '--input', 'num=3',
     '--input', 'resourceType=微博资源',
+    '--generation', 'submit-resources.weibo.authType.selection=balanced',
+    '--generation', 'submit-resources.weibo.name.unique=true',
   ));
   await writeFile(fakeRunnerPath, `
 import { existsSync } from 'node:fs';
@@ -1230,6 +1356,15 @@ console.log(JSON.stringify({
   reason: shouldFail ? 'Timeout after submit' : '',
   url: 'https://example.test/form',
   extracted: { submittedName: get('loop.item.name') },
+  boundaryEvidence: {
+    kind: 'text',
+    expected: '成功',
+    satisfied: !shouldFail,
+    checkedAt: new Date().toISOString(),
+    durationMs: 1,
+    url: 'https://example.test/form'
+  },
+  durationMs: 2,
   results: [],
   commitFile
 }));
@@ -1248,6 +1383,15 @@ console.log(JSON.stringify({
   assert.equal(failed.loops['submit-resources'].items['1'].name, 'weibo-resource-2');
   assert.equal(failed.loops['submit-resources'].items['1'].weiboOnly, true);
   assert.equal(failed.loops['submit-resources'].items['1'].xhsOnly, undefined);
+  assert.equal(Object.keys(failed.loops['submit-resources'].items).length, 3);
+  assert.equal(
+    new Set(Object.values(failed.loops['submit-resources'].items).map((item) => item.name)).size,
+    3,
+  );
+  assert.equal(
+    new Set(Object.values(failed.loops['submit-resources'].items).map((item) => item.authType)).size,
+    3,
+  );
   const persistedSecondItem = failed.loops['submit-resources'].items['1'];
 
   const resumed = JSON.parse(executeWithEnv(
@@ -1255,16 +1399,41 @@ console.log(JSON.stringify({
     '--run', id,
   ));
   assert.equal(resumed.status, 'workflow-segment-complete');
-  assert.equal(resumed.executed.length, 1);
+  assert.equal(resumed.executed.length, 2);
   assert.equal(resumed.executed[0].iterationCount, 3);
   assert.equal(resumed.executed[0].resumedFromIndex, 1);
   const completed = JSON.parse(run('show', '--run', id));
-  assert.equal(completed.plan.length, 1);
-  assert.equal(completed.plan[0].status, 'completed');
+  assert.equal(completed.plan.length, 2);
+  assert.equal(completed.plan.every((step) => step.status === 'completed'), true);
   assert.equal(completed.loops['submit-resources'].status, 'completed');
   assert.equal(completed.loops['submit-resources'].nextIndex, 3);
   assert.deepEqual(completed.loops['submit-resources'].items['1'], persistedSecondItem);
   assert.equal(completed.loops['submit-resources'].results.length, 3);
+  assert.equal(completed.loops['submit-resources'].summary.completedCount, 3);
+  assert.equal(completed.loops['submit-resources'].summary.distinct.name, 3);
+  assert.equal(completed.loops['submit-resources'].summary.policySatisfied['name.unique'], true);
+  assert.equal(
+    completed.loops['submit-resources'].summary.policySatisfied['authType.balanced'],
+    true,
+  );
+  assert.deepEqual(
+    completed.data.executionSummary['submit-resources'],
+    completed.loops['submit-resources'].summary,
+  );
+  assert.deepEqual(
+    completed.data.reports['report-result'],
+    completed.loops['submit-resources'].summary,
+  );
+  assert.equal(
+    completed.loops['submit-resources'].results[0].boundaryEvidence.satisfied,
+    true,
+  );
+  const evidence = readFileSync(
+    join(root, '.workflow-runs', id, 'evidence.jsonl'),
+    'utf8',
+  ).trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(evidence.length, 4);
+  assert.equal(evidence.at(-1).data.boundaryEvidence.expected, '成功');
 });
 
 test('foreach derives its iteration count from structured run inputs', async (t) => {
@@ -1291,6 +1460,7 @@ test('foreach derives its iteration count from structured run inputs', async (t)
       rm(inputsPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   await writeFile(compilerPath, JSON.stringify({
@@ -1327,6 +1497,7 @@ test('foreach derives its iteration count from structured run inputs', async (t)
     total: 2,
     nextIndex: 0,
     generationRouteId: null,
+    materializedCount: 2,
   });
 });
 
@@ -1359,6 +1530,25 @@ test('workflow cache rejects and clears non-canonical artifacts at any depth', a
   assert.equal(existsSync(nestedDraftDir), false);
 });
 
+test('cache lifecycle can preview and remove canonical caches whose Prompt was deleted', async () => {
+  const orphanKey = 'prompt-deadbeef0000';
+  const roots = ['definitions', 'pages', 'profiles']
+    .map((area) => join(root, '.workflow-cache', area, orphanKey));
+  await Promise.all(roots.map((path) => mkdir(path, { recursive: true })));
+  await Promise.all(roots.map((path) => writeFile(join(path, 'placeholder'), '', 'utf8')));
+
+  const preview = JSON.parse(cache('clear', '--scope', 'orphans'));
+  for (const area of ['definitions', 'pages', 'profiles']) {
+    assert.equal(
+      preview.targets.includes(`.workflow-cache/${area}/${orphanKey}`),
+      true,
+    );
+  }
+  const cleared = JSON.parse(cache('clear', '--scope', 'orphans', '--apply', 'true'));
+  assert.equal(cleared.status, 'cleared');
+  assert.equal(roots.every((path) => !existsSync(path)), true);
+});
+
 test('page switching and coordinate vision actions are batchable cached operations', async (t) => {
   const suffix = `${process.pid}-${Date.now()}`;
   const promptDir = join(root, '.github', 'prompts');
@@ -1374,6 +1564,7 @@ test('page switching and coordinate vision actions are batchable cached operatio
       rm(promptPath, { force: true }),
       rm(join(root, '.workflow-cache', 'definitions', prepared.prompt.key), { recursive: true, force: true }),
       rm(join(root, '.workflow-cache', 'pages', prepared.prompt.key), { recursive: true, force: true }),
+      rm(join(root, '.workflow-cache', 'profiles', prepared.prompt.key), { recursive: true, force: true }),
     ]);
   });
   cache(

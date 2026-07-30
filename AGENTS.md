@@ -38,6 +38,13 @@ configuration file, selector map, or project-specific script before starting.
   `iteration.generate` and put branch-only fields in `iteration.generateByRoute.<route-id>`.
   Resolve the route from structural run inputs before generating the item. Do not invent business
   constraints such as uniqueness, price ranges, or option sets unless the Prompt declares them.
+- Treat a field rule explicitly supplied for the current task as a run override. Pass it through
+  `workflow init --generation <node>.<route>.<field>.<setting>=<value>`. The run snapshots the
+  effective generation profile, so later profile changes cannot alter an active batch. Unless the
+  user says the rule is only for this run, successful completion promotes the override into the
+  Prompt's shared defaults; use `--remember-generation false` for one-run rules.
+- Materialize and validate the complete loop batch before the first irreversible iteration. A
+  failure resumes from the persisted item and index; it must not regenerate the remaining batch.
 - Classify every produced value as exactly one of: page `collects`, boundary `asserts`, or local
   `computes`. Never manually add a fact that the compiled transaction declares as produced.
 - Store workflow-specific explanatory text in the compiled Workflow fields (`description`,
@@ -63,6 +70,9 @@ configuration file, selector map, or project-specific script before starting.
 - A decision or report transaction must calculate and commit its declared facts and outputs before
   it is marked complete. Do not replace deterministic local computation with separate `fact`,
   `decision`, `output`, or `complete` commands.
+- Loop completion automatically writes `executionSummary.<node-id>`. A separate report node should
+  either compute declared outputs or use `reportFromLoop`; do not add an empty report node merely
+  to mark the workflow complete.
 - Save a boundary before a long wait or risky action. It must identify the current step, next action, current Web system, and last useful URL.
 - Never copy inputs, facts, decisions, or outputs from another run unless the current prompt explicitly requires it.
 - When recovering without conversation context, select the run by its business inputs. Do not assume the most recently updated run is the intended one when multiple runs could match.
@@ -83,16 +93,18 @@ configuration file, selector map, or project-specific script before starting.
 - Declare each node's routing dependencies with `--depends-on`. Resolve a run with `recipe-resolve --value key=value`. A `ready` result is executable; `needs-facts` means observe only the missing facts; `needs-learning` or `ambiguous` returns control to the model for that node only. Never execute another route as a fallback for an unknown value.
 - Page caches store named variants. A variant represents a material UI context such as role, locale, tenant, or page version, and contains a fingerprint, semantic actions, locator candidates, postconditions, and result telemetry. They must not store snapshot refs, live DOM nodes, credentials, verification values, cookies, tokens, or run-specific business values.
 - `.workflow-cache` has a strict canonical whitelist: compiled definitions belong only at
-  `definitions/<prompt-key>/<prompt-hash>.json`, and reusable page actions belong only at
-  `pages/<prompt-key>/shared/<page-id>.json`. Every other file, including compiler drafts and
-  otherwise declarative root JSON, is invalid. Reusable implementation belongs in `src`;
-  run-specific JSON, evidence, and executor-generated temporary files belong under
+  `definitions/<prompt-key>/<prompt-hash>.json`, reusable page actions belong only at
+  `pages/<prompt-key>/shared/<page-id>.json`, and remembered field defaults belong only at
+  `profiles/<prompt-key>/defaults.json`. Every other file, including compiler drafts and otherwise
+  declarative root JSON, is invalid. Reusable implementation belongs in `src`; run-specific JSON,
+  materialized loop items, evidence, and executor-generated temporary files belong under
   `.workflow-runs/<run-id>`.
 - Prefer `pnpm compile -- --prompt-key <prompt-key> --stdin true` and pipe the compiler artifact
   through stdin. If a diagnostic compiler file is necessary, keep it outside `.workflow-cache`
   and remove it after compilation. Use `pnpm cachectl clear --scope drafts` to preview legacy
   non-canonical artifacts at any cache depth and add `--apply true` only when they should be
-  removed.
+  removed. Use `pnpm cachectl clear --scope orphans` to preview canonical cache directories whose
+  Prompt file was removed.
 - On a valid recipe and page-variant hit, execute the continuous cached browser segment through
   `pnpm execute -- --run <run-id>`. It executes successive page transactions, commits their
   resumable boundaries, resolves cached decision and report nodes locally, and stops only for a
@@ -127,7 +139,8 @@ configuration file, selector map, or project-specific script before starting.
   - learn a new guarded recipe route when a previously unseen business type appears;
   - version the affected recipe node when the business sequence itself changed.
 - Never overwrite an old page variant merely because another tenant or role has a different layout. Never reuse a cached batch blindly for an irreversible or high-impact operation.
-- Preview cache deletion with `pnpm cachectl clear --prompt-key <key> --scope <current|pages|workflow>`.
+- Preview cache deletion with
+  `pnpm cachectl clear --prompt-key <key> --scope <current|pages|profile|workflow>`.
   Add `--apply true` only after verifying the exact targets printed by the preview.
 
 ## Safety

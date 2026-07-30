@@ -9,6 +9,7 @@ const PROMPTS_ROOT = join(ROOT, '.github', 'prompts');
 const ALLOWED_CACHE_FILES = [
   /^definitions\/prompt-[a-f0-9]{12}\/[a-f0-9]{16}\.json$/,
   /^pages\/prompt-[a-f0-9]{12}\/shared\/[a-z][a-z0-9-]*\.json$/,
+  /^profiles\/prompt-[a-f0-9]{12}\/defaults\.json$/,
 ];
 const ALLOWED_CACHE_DIRECTORIES = [
   /^definitions$/,
@@ -16,6 +17,8 @@ const ALLOWED_CACHE_DIRECTORIES = [
   /^pages$/,
   /^pages\/prompt-[a-f0-9]{12}$/,
   /^pages\/prompt-[a-f0-9]{12}\/shared$/,
+  /^profiles$/,
+  /^profiles\/prompt-[a-f0-9]{12}$/,
 ];
 
 function sha256(value) {
@@ -122,6 +125,7 @@ export function cachePaths(identity) {
     definitionPath: join(CACHE_ROOT, 'definitions', identity.key, `${identity.hash}.json`),
     pagesDir: join(CACHE_ROOT, 'pages', identity.key, 'shared'),
     legacyPagesDir: join(CACHE_ROOT, 'pages', identity.key, identity.hash),
+    profilePath: join(CACHE_ROOT, 'profiles', identity.key, 'defaults.json'),
   };
 }
 
@@ -174,6 +178,18 @@ export async function ensurePromptCache(identity) {
       updatedAt: now,
     });
   }
+  if (!existsSync(paths.profilePath)) {
+    const now = new Date().toISOString();
+    await atomicWriteJson(paths.profilePath, {
+      schemaVersion: 1,
+      promptKey: identity.key,
+      revision: 1,
+      defaults: {},
+      history: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
   return paths;
 }
 
@@ -181,6 +197,62 @@ export function cacheDisplayPaths(paths) {
   return {
     definition: portablePath(relative(ROOT, paths.definitionPath)),
     pages: portablePath(relative(ROOT, paths.pagesDir)),
+    profile: portablePath(relative(ROOT, paths.profilePath)),
+  };
+}
+
+export function normalizeProfile(profile, identity = null) {
+  profile.schemaVersion ??= 1;
+  profile.promptKey ??= identity?.key ?? '';
+  profile.revision ??= 1;
+  profile.defaults ??= {};
+  profile.history ??= [];
+  profile.createdAt ??= new Date().toISOString();
+  profile.updatedAt ??= profile.createdAt;
+  return profile;
+}
+
+function mergeProfilePatch(target, patch) {
+  for (const [key, value] of Object.entries(patch ?? {})) {
+    if (value === null) {
+      delete target[key];
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      mergeProfilePatch(target[key] ??= {}, value);
+      if (Object.keys(target[key]).length === 0) delete target[key];
+    } else {
+      target[key] = structuredClone(value);
+    }
+  }
+  return target;
+}
+
+export async function promoteProfileOverrides(identity, {
+  baseRevision,
+  overrides,
+  runId,
+}) {
+  const paths = cachePaths(identity);
+  const profile = normalizeProfile(await readJson(paths.profilePath), identity);
+  if (Object.keys(overrides ?? {}).length === 0) {
+    return { status: 'unchanged', revision: profile.revision };
+  }
+  const rebased = profile.revision !== baseRevision;
+  mergeProfilePatch(profile.defaults, overrides);
+  profile.revision += 1;
+  profile.updatedAt = new Date().toISOString();
+  profile.history.push({
+    revision: profile.revision,
+    baseRevision,
+    runId,
+    at: profile.updatedAt,
+    patch: structuredClone(overrides),
+  });
+  profile.history = profile.history.slice(-20);
+  await atomicWriteJson(paths.profilePath, profile);
+  return {
+    status: 'promoted',
+    revision: profile.revision,
+    rebasedFromRevision: rebased ? baseRevision : null,
   };
 }
 

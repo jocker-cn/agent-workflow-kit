@@ -210,6 +210,23 @@ The Runner resolves the structural route first, then merges common `generate` fi
 that route's `generateByRoute` fields. Route guards for such a node therefore cannot depend on
 `loop.*` or the item alias; those values do not exist until after route selection.
 
+Current-task field rules are supplied when the run is initialized, rather than copied into the
+compiled topology:
+
+```bash
+pnpm workflow init --summary "Submit 20 resources" --prompt-key <prompt-key> \
+  --input resourceType=微信资源 --input num=20 \
+  --generation submit-resources.weixin.authType.selection=balanced \
+  --generation submit-resources.weixin.name.unique=true
+```
+
+Supported choice selection strategies are `random`, `cycle`, `balanced`, `shuffle-cycle`, and
+`unique`. Any field may also declare `unique=true`, which validates the fully rendered field
+values across the materialized batch. The effective settings are resolved once as:
+current Run Overlay over Prompt-scoped remembered defaults. They augment the compiled field
+generator; they never create extra nodes or numbered routes. Use `--remember-generation false`
+when the current rules must not become defaults after successful completion.
+
 A local comparison/report transaction can calculate facts and outputs without returning to the
 model:
 
@@ -238,6 +255,23 @@ model:
   ]
 }
 ```
+
+A report whose only purpose is to expose the structured result of a completed loop references that
+loop explicitly:
+
+```json
+{
+  "id": "report-result",
+  "title": "Report the submitted batch",
+  "type": "report",
+  "after": ["submit-resources"],
+  "reportFromLoop": "submit-resources"
+}
+```
+
+The loop itself already writes `executionSummary.submit-resources`, including requested,
+completed, and failed counts, total browser duration, distinct field counts, value distributions,
+and policy checks. Do not add an empty report transaction.
 
 ## Field rules
 
