@@ -8,11 +8,20 @@ importers:
 
   .:
     devDependencies:
+      '@microsoft/winappcli':
+        specifier: 0.5.0
+        version: 0.5.0
       '@playwright/cli':
         specifier: ^0.1.17
         version: 0.1.17
 
 packages:
+
+  '@microsoft/winappcli@0.5.0':
+    resolution: {integrity: sha512-EZbMc1XQTCAkBeIZTWPCc0f3s53yGernSWjwHyJLj5xTPX2wHvT3oWSyXkAjzj/Wvkd286jGE7/gYG+Kjq4uKg==}
+    engines: {node: '>=18.0.0'}
+    os: [win32]
+    hasBin: true
 
   '@playwright/cli@0.1.17':
     resolution: {integrity: sha512-VBw6y3p8eqOqmjKg07IkWSPGKJkpIhMRNDFI6DOYsDD6fAfcI1XYEWMLWyhSZQ0B/Oc2KN49eq4XqE64PUPHBg==}
@@ -35,6 +44,8 @@ packages:
     hasBin: true
 
 snapshots:
+
+  '@microsoft/winappcli@0.5.0': {}
 
   '@playwright/cli@0.1.17':
     dependencies:

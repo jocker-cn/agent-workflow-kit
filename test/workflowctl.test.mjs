@@ -1644,3 +1644,20 @@ test('official Playwright Skill and prompt-first project guidance are present', 
   assert.equal(existsSync(join(root, 'knowledge')), false);
   assert.equal(existsSync(join(root, 'src', 'browser')), false);
 });
+
+test('WinAppCLI desktop automation is project-local, version-aligned, and optional', () => {
+  const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const skillRoot = join(root, '.agents', 'skills', 'winapp-ui-automation');
+  const skill = readFileSync(join(skillRoot, 'SKILL.md'), 'utf8');
+  const provenance = readFileSync(join(skillRoot, 'UPSTREAM.md'), 'utf8');
+  const guidance = readFileSync(join(root, 'AGENTS.md'), 'utf8');
+
+  assert.equal(packageJson.devDependencies['@microsoft/winappcli'], '0.5.0');
+  assert.equal(packageJson.scripts.desktop, 'winapp ui');
+  assert.match(skill, /version: 0\.5\.0/);
+  assert.match(skill, /pnpm desktop/);
+  assert.equal(existsSync(join(skillRoot, 'references', 'ui-json-envelope.md')), true);
+  assert.match(provenance, /Tag: `v0\.5\.0`/);
+  assert.match(guidance, /Before automating a Windows desktop application/);
+  assert.match(guidance, /Desktop support is optional and independent from browser execution/);
+});

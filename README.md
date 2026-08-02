@@ -1,11 +1,13 @@
 # Agent Workflow Kit
 
-让 Copilot Agent 直接执行用户用自然语言描述的浏览器流程。
+让 Copilot Agent 直接执行用户用自然语言描述的浏览器和 Windows 桌面流程。
 
 用户不需要新增项目目录、业务 Skill、YAML、selector 或脚本。项目只提供：
 
 - 项目本地的官方 Playwright CLI Skill，负责观察页面和操作浏览器；
+- 项目本地的官方 WinAppCLI UI Automation Skill，负责观察和操作 Windows 应用；
 - 项目本地的 Workflow Compiler Skill，负责把不规整的 Prompt 编译成页面事务；
+- 项目本地的 Desktop Workflow Compiler Skill，负责把多步桌面操作编译成连续事务；
 - `AGENTS.md`，负责通用执行规则、安全边界和人工步骤衔接；
 - 按 Prompt 隔离的流程定义与页面操作缓存；
 - 面向跨 Copilot 会话恢复的通用执行状态。
@@ -45,8 +47,12 @@ Agent 会在首次运行时读取完整 Prompt，先从最终输出反推所需�
 
 ```text
 .agents/skills/playwright-cli/  官方 Playwright CLI Skill
+.agents/skills/winapp-ui-automation/
+                                官方 WinAppCLI UI Automation Skill（项目本地调用）
 .agents/skills/compile-browser-workflows/
                                 Prompt 到页面事务的通用编译规则
+.agents/skills/compile-desktop-workflows/
+                                Prompt 到 Windows 桌面事务的通用编译规则
 .github/prompts/                用户维护的自然语言流程
 .workflow-cache/                Agent 自动学习的 Prompt 专属缓存
 .workflow-runs/                 每次执行的状态与断点
@@ -259,6 +265,44 @@ Recipe 中跨页面的动作会按连续 Page Variant 分组。对于 SPA 跳转
 使用 `prompt-key` 是为了避免 Windows shell 对包含中文、空格的 Prompt 路径进行错误拆分。Prompt 文件名和正文不需要因此修改。
 
 浏览器安装、会话和排障细节见 [docs/playwright-cli.md](docs/playwright-cli.md)。
+
+## Windows 桌面 UI
+
+WinAppCLI 是可选能力，不会改变已有 Playwright 命令和浏览器工作流。依赖与官方 Skill
+固定在同一个 `0.5.0` 版本；无需 Winget、全局 npm 包或 MCP。Agent 在桌面任务中通过项目脚本调用：
+
+```bash
+pnpm desktop:help
+pnpm desktop list-windows --json
+pnpm desktop inspect -a notepad --interactive
+```
+
+WinAppCLI 使用 Windows UI Automation，可操作 WinUI、WPF、WinForms、Win32 和 Electron
+应用。稳定操作优先使用 AutomationId、`invoke`、`set-value` 和 `wait-for`；只有 UIA
+模式不可用时才使用真实鼠标或键盘注入。
+
+多步桌面流程不需要让 Agent 每执行一次点击就重新规划。Agent 会把当前业务边界内的动作生成
+为 `.workflow-runs/<run-id>/` 下的声明式事务，然后一次提交：
+
+```bash
+pnpm desktop:batch -- --run <run-id> \
+  --file .workflow-runs/<run-id>/<transaction>.json
+```
+
+事务支持 UIA 语义操作、键盘导航、短等待、读值、滚动和窗口相对坐标回退。默认保持窗口位置
+和大小不变；相对坐标会根据 UIA 返回的实时 Windows 窗口矩形转换，不会把窗口截图坐标误当成
+屏幕绝对坐标。正常 Cache 路径只在事务边界截图一次，失败时停止在准确的 action id 并补充
+失败截图。
+属于可恢复 run 的事务还会生成一个聚合的 `last-boundary.json`，Agent 只提交一次 workflow
+checkpoint，不会为每个桌面动作分别启动状态命令。
+
+对于名称明确的会话、记录、文档或菜单项，编译器优先使用应用内精确搜索，并区分本地结果、
+功能入口和网络搜索等结果类型；滚动列表仅作为搜索不可用时的 fallback。没有暴露 UIA 的 Qt、
+自绘界面仍可使用窗口相对坐标和单次边界截图，由模型只在业务边界做一次视觉确认。
+
+事务 JSON 是 Agent 生成的运行状态，不是用户配置，也不会进入 `.workflow-cache`。密码等敏感
+内容通过 `valueFrom: "env.NAME"` 读取，不会写入计划或执行结果。具体内部字段见项目 Skill：
+[compile-desktop-workflows](.agents/skills/compile-desktop-workflows/SKILL.md)。
 
 ## 验证
 

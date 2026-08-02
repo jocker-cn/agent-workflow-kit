@@ -13,6 +13,38 @@ configuration file, selector map, or project-specific script before starting.
 - Follow the current business Prompt for credential entry, verification challenges, and human participation. Do not impose a repository-wide password or CAPTCHA policy.
 - Do not inspect hidden network payloads.
 
+## Windows desktop execution
+
+- Before automating a Windows desktop application, read
+  `.agents/skills/winapp-ui-automation/SKILL.md` in full.
+- Before compiling a multi-step desktop task, also read
+  `.agents/skills/compile-desktop-workflows/SKILL.md` in full.
+- Use only the repository-local WinAppCLI through `pnpm desktop`; do not depend on a global
+  `winapp`, Winget installation, MCP server, or host-provided Computer Use capability.
+- Execute a stable multi-action desktop transaction through `pnpm desktop:batch` instead of
+  returning to the model after every successful click. Generate its declarative JSON only under
+  `.workflow-runs/<run-id>`; it is run state, not a reusable script or Cache artifact.
+- For a resumable run, include the desktop transaction's workflow boundary mapping and commit the
+  returned `.workflow-runs/<run-id>/last-boundary.json` once. Never checkpoint each desktop action.
+- Target applications by process/title first and switch to an HWND when multiple windows match.
+- Prefer UI Automation operations such as `invoke`, `set-value`, and `wait-for`. Use injected mouse
+  or keyboard input only when the target control cannot be operated through UIA and the interactive
+  desktop is unlocked.
+- Prefer exact in-application search for a known named conversation, record, document, or menu item.
+  Select the correct result category; use scrolling only when search is unavailable or positional
+  browsing is part of the request.
+- Preserve the user's window position and size unless the Prompt explicitly requests a change.
+  Convert cached visual targets from normalized window-relative coordinates using the live UIA
+  window rectangle. Never use screenshot-relative pixels as absolute Windows screen coordinates.
+- On the fast path, capture at most one screenshot at the transaction boundary. Capture an
+  additional screenshot only on failure or a declared human/visual boundary. Applications without
+  usable UIA may require the model to review that one boundary screenshot.
+- Treat desktop selectors like browser locators: discover them from the current UI, cache only stable
+  AutomationIds or validated semantic selectors, and re-inspect the affected window when a cached
+  selector or boundary check fails.
+- Desktop support is optional and independent from browser execution. Do not route a browser task
+  through WinAppCLI or change an existing Playwright workflow merely because WinAppCLI is installed.
+
 ## Interpreting prompts
 
 - Before creating or revising a reusable Workflow Recipe, read

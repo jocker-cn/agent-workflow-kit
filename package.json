@@ -2,7 +2,7 @@
   "name": "agent-workflow-kit",
   "version": "0.1.0",
   "private": true,
-  "description": "Prompt-driven, browser-assisted workflow foundation for coding agents.",
+  "description": "Prompt-driven browser and Windows desktop workflow foundation for coding agents.",
   "type": "module",
   "scripts": {
     "workflow": "node ./src/workflowctl.mjs",
@@ -10,19 +10,28 @@
     "compile": "node ./src/workflow-compiler.mjs",
     "recipe": "node ./src/recipe-runner.mjs",
     "execute": "node ./src/workflow-runner.mjs",
-    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs && node --check ./src/workflow-compiler.mjs && node --check ./src/recipe-runner.mjs && node --check ./src/workflow-runner.mjs",
+    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs && node --check ./src/workflow-compiler.mjs && node --check ./src/recipe-runner.mjs && node --check ./src/workflow-runner.mjs && node --check ./src/desktop-batch.mjs",
     "test": "node --test",
     "browser": "playwright-cli",
     "browser:help": "playwright-cli --help",
     "browser:install": "playwright-cli install",
-    "browser:install-browser": "playwright-cli install-browser chromium"
+    "browser:install-browser": "playwright-cli install-browser chromium",
+    "desktop": "winapp ui",
+    "desktop:batch": "node ./src/desktop-batch.mjs",
+    "desktop:help": "winapp ui --help",
+    "winapp:help": "winapp --help"
   },
   "engines": {
     "node": ">=20"
   },
   "packageManager": "pnpm@10.30.3",
-  "devDependencies": {
-    "@playwright/cli": "^0.1.17"
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@microsoft/winappcli"
+    ]
   },
-  "dependencies": {}
+  "devDependencies": {
+    "@microsoft/winappcli": "0.5.0",
+    "@playwright/cli": "^0.1.17"
+  }
 }

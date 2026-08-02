@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compile Desktop Workflows"
+  short_description: "Compile prompt-driven Windows desktop transactions"
+  default_prompt: "Use $compile-desktop-workflows to turn this Windows desktop task into one stable resumable transaction."
