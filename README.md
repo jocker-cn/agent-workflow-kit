@@ -275,6 +275,7 @@ WinAppCLI 是可选能力，不会改变已有 Playwright 命令和浏览器工�
 pnpm desktop:help
 pnpm desktop list-windows --json
 pnpm desktop inspect -a notepad --interactive
+pnpm desktop:window -- --hwnd <hwnd> --mode restore
 ```
 
 WinAppCLI 使用 Windows UI Automation，可操作 WinUI、WPF、WinForms、Win32 和 Electron
@@ -289,12 +290,19 @@ pnpm desktop:batch -- --run <run-id> \
   --file .workflow-runs/<run-id>/<transaction>.json
 ```
 
-事务支持 UIA 语义操作、键盘导航、短等待、读值、滚动和窗口相对坐标回退。默认保持窗口位置
-和大小不变；相对坐标会根据 UIA 返回的实时 Windows 窗口矩形转换，不会把窗口截图坐标误当成
-屏幕绝对坐标。正常 Cache 路径只在事务边界截图一次，失败时停止在准确的 action id 并补充
-失败截图。
+事务支持 UIA 语义操作、键盘导航、短等待、读值、滚动和窗口相对坐标回退。纯 UIA 事务可以
+在后台执行；默认的 `activation.mode=auto` 只会在鼠标模拟、滚轮或 `send-input` 等依赖前台
+的动作之前，通过 Node 调用 Win32 API 恢复和激活目标窗口，不会使用 `screenshot --focus`
+管理窗口。默认保持窗口位置和大小不变；相对坐标会根据 UIA 返回的实时 Windows 窗口矩形转换，
+不会把窗口截图坐标误当成屏幕绝对坐标。正常 Cache 路径只在事务边界截图一次，失败时停止在
+准确的 action id 并补充失败截图。
 属于可恢复 run 的事务还会生成一个聚合的 `last-boundary.json`，Agent 只提交一次 workflow
 checkpoint，不会为每个桌面动作分别启动状态命令。
+
+没有人工或风险边界的跨桌面应用步骤会合并成一个多窗口 batch。例如 SecureCRT 读取状态后，
+可以在同一进程内读取窗口标题、用正则提取字段、渲染微信消息并切换到微信发送，不需要在两个
+应用之间返回模型。正式截图只写入 `.workflow-runs/<run-id>/evidence/<transaction-id>/`；失败
+诊断图写入 `diagnostics/<transaction-id>/`，修复成功后自动删除。PNG 不允许直接出现在 run 根目录。
 
 对于名称明确的会话、记录、文档或菜单项，编译器优先使用应用内精确搜索，并区分本地结果、
 功能入口和网络搜索等结果类型；滚动列表仅作为搜索不可用时的 fallback。没有暴露 UIA 的 Qt、

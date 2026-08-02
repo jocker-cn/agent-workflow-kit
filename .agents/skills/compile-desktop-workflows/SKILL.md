@@ -15,6 +15,8 @@ through `pnpm desktop:batch`. Do not translate Prompt sentences into separate sh
 2. Group adjacent work by application, window, material view state, and user barrier. Keep opening a
    known view, filling its fields, submitting it, and collecting its result in one transaction when
    no human or context boundary separates them.
+   When one desktop application's output feeds another, use one multi-window batch with named
+   targets, local extraction, and a template action unless a real barrier requires a checkpoint.
 3. Prefer interaction methods in this order:
    - stable UIA AutomationId or selector;
    - semantic text with an unambiguous UIA ancestor;
@@ -45,6 +47,16 @@ pnpm desktop:batch -- --run <run-id> \
 
 Use one boundary screenshot by default. Do not take screenshots between successful actions.
 WinAppCLI command success is action telemetry; the final boundary is the business verification.
+UIA-only transactions stay in the background. The default `activation.mode=auto` uses the runner's
+native Win32 activation path only before foreground-dependent mouse, wheel, or `send-input` actions;
+never take a screenshot to restore or focus a window. Durable screenshots belong under
+`evidence/<transaction-id>/`; failure
+diagnostics belong under `diagnostics/<transaction-id>/` and are removed after a successful repair.
+For exploration outside a batch, use:
+
+```bash
+pnpm desktop:window -- --hwnd <hwnd> --mode restore
+```
 When the transaction belongs to a resumable run, include its `workflow` mapping in the generated
 JSON, then commit the returned boundary once:
 

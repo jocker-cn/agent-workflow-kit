@@ -1653,7 +1653,9 @@ test('WinAppCLI desktop automation is project-local, version-aligned, and option
   const guidance = readFileSync(join(root, 'AGENTS.md'), 'utf8');
 
   assert.equal(packageJson.devDependencies['@microsoft/winappcli'], '0.5.0');
-  assert.equal(packageJson.scripts.desktop, 'winapp ui');
+  assert.equal(packageJson.scripts.desktop, 'node ./src/desktop-cli.mjs');
+  assert.equal(packageJson.scripts['desktop:window'], 'node ./src/desktop-windowctl.mjs');
+  assert.equal(packageJson.dependencies.koffi, '3.1.4');
   assert.match(skill, /version: 0\.5\.0/);
   assert.match(skill, /pnpm desktop/);
   assert.equal(existsSync(join(skillRoot, 'references', 'ui-json-envelope.md')), true);

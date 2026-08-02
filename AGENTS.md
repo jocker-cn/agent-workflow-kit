@@ -24,6 +24,9 @@ configuration file, selector map, or project-specific script before starting.
 - Execute a stable multi-action desktop transaction through `pnpm desktop:batch` instead of
   returning to the model after every successful click. Generate its declarative JSON only under
   `.workflow-runs/<run-id>`; it is run state, not a reusable script or Cache artifact.
+- When consecutive desktop steps cross applications without a human or risk barrier, compile them
+  into one multi-window desktop batch. Extract visible values and render downstream input inside
+  the batch; do not return to the model merely to move data from one desktop app to another.
 - For a resumable run, include the desktop transaction's workflow boundary mapping and commit the
   returned `.workflow-runs/<run-id>/last-boundary.json` once. Never checkpoint each desktop action.
 - Target applications by process/title first and switch to an HWND when multiple windows match.
@@ -39,6 +42,15 @@ configuration file, selector map, or project-specific script before starting.
 - On the fast path, capture at most one screenshot at the transaction boundary. Capture an
   additional screenshot only on failure or a declared human/visual boundary. Applications without
   usable UIA may require the model to review that one boundary screenshot.
+- Let the desktop runner's default `activation.mode=auto` keep UIA-only transactions in the
+  background. It restores and activates a window only for foreground-dependent mouse, wheel, or
+  `send-input` actions. Use an explicit `restore` only when foreground visibility is itself part of
+  the Prompt. For ad-hoc exploration use `pnpm desktop:window -- --hwnd <hwnd> --mode restore`.
+  Never use `screenshot --focus` as a window-management operation; the project wrapper rejects it.
+- Store durable screenshots only under `.workflow-runs/<run-id>/evidence/<transaction-id>/` and
+  failed exploratory screenshots only under `.workflow-runs/<run-id>/diagnostics/<transaction-id>/`.
+  Never place PNG files directly in the run root. The runner removes its transaction diagnostics
+  after a later successful execution; Cache never contains screenshots.
 - Treat desktop selectors like browser locators: discover them from the current UI, cache only stable
   AutomationIds or validated semantic selectors, and re-inspect the affected window when a cached
   selector or boundary check fails.

@@ -10,14 +10,15 @@
     "compile": "node ./src/workflow-compiler.mjs",
     "recipe": "node ./src/recipe-runner.mjs",
     "execute": "node ./src/workflow-runner.mjs",
-    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs && node --check ./src/workflow-compiler.mjs && node --check ./src/recipe-runner.mjs && node --check ./src/workflow-runner.mjs && node --check ./src/desktop-batch.mjs",
+    "check": "node --check ./src/workflowctl.mjs && node --check ./src/cachectl.mjs && node --check ./src/cache-store.mjs && node --check ./src/workflow-compiler.mjs && node --check ./src/recipe-runner.mjs && node --check ./src/workflow-runner.mjs && node --check ./src/windows-window.mjs && node --check ./src/desktop-cli.mjs && node --check ./src/desktop-windowctl.mjs && node --check ./src/desktop-batch.mjs",
     "test": "node --test",
     "browser": "playwright-cli",
     "browser:help": "playwright-cli --help",
     "browser:install": "playwright-cli install",
     "browser:install-browser": "playwright-cli install-browser chromium",
-    "desktop": "winapp ui",
+    "desktop": "node ./src/desktop-cli.mjs",
     "desktop:batch": "node ./src/desktop-batch.mjs",
+    "desktop:window": "node ./src/desktop-windowctl.mjs",
     "desktop:help": "winapp ui --help",
     "winapp:help": "winapp --help"
   },
@@ -27,11 +28,15 @@
   "packageManager": "pnpm@10.30.3",
   "pnpm": {
     "onlyBuiltDependencies": [
-      "@microsoft/winappcli"
+      "@microsoft/winappcli",
+      "koffi"
     ]
   },
   "devDependencies": {
     "@microsoft/winappcli": "0.5.0",
     "@playwright/cli": "^0.1.17"
+  },
+  "dependencies": {
+    "koffi": "3.1.4"
   }
 }

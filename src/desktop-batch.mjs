@@ -2,11 +2,12 @@
 
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { ROOT, atomicWriteJson } from './cache-store.mjs';
+import { activateWindow } from './windows-window.mjs';
 
 const execFileAsync = promisify(execFile);
 const RUNS_ROOT = join(ROOT, '.workflow-runs');
@@ -21,6 +22,7 @@ const WINAPP_CLI = join(
 const COMMANDS = new Set([
   'click',
   'drag',
+  'extract-regex',
   'focus',
   'get-property',
   'get-value',
@@ -32,9 +34,19 @@ const COMMANDS = new Set([
   'search',
   'send-keys',
   'set-value',
+  'template',
   'wait-for',
+  'window-info',
 ]);
-const READ_COMMANDS = new Set(['get-property', 'get-value', 'inspect', 'search']);
+const READ_COMMANDS = new Set([
+  'extract-regex',
+  'get-property',
+  'get-value',
+  'inspect',
+  'search',
+  'template',
+  'window-info',
+]);
 
 function usage(exitCode = 0) {
   console.log(`
@@ -165,13 +177,24 @@ export function resolveRelativePoint(point, rectangle) {
   };
 }
 
-function normalizeTarget(raw = {}) {
+function normalizeTarget(raw = {}, label = 'target') {
   if (!raw.app && !raw.process && !raw.title && !raw.hwnd) {
-    throw new Error('target requires app, process, title, or hwnd');
+    throw new Error(`${label} requires app, process, title, or hwnd`);
   }
   const hwnd = raw.hwnd === undefined ? null : Number(raw.hwnd);
   if (hwnd !== null && (!Number.isInteger(hwnd) || hwnd <= 0)) {
-    throw new Error('target.hwnd must be a positive integer');
+    throw new Error(`${label}.hwnd must be a positive integer`);
+  }
+  let activation = null;
+  if (raw.activation !== false) {
+    const mode = raw.activation?.mode ?? 'auto';
+    if (!['auto', 'activate', 'restore'].includes(mode)) {
+      throw new Error(`${label}.activation.mode must be auto, activate, or restore`);
+    }
+    activation = {
+      mode,
+      timeoutMs: positiveNumber(raw.activation?.timeoutMs ?? 3000, `${label}.activation.timeoutMs`),
+    };
   }
   return {
     app: String(raw.app ?? raw.process ?? raw.title ?? '').trim(),
@@ -181,8 +204,17 @@ function normalizeTarget(raw = {}) {
     process: String(raw.process ?? '').trim(),
     className: String(raw.className ?? '').trim(),
     preserveGeometry: raw.preserveGeometry !== false,
-    geometryTolerancePx: positiveNumber(raw.geometryTolerancePx ?? 2, 'geometryTolerancePx', { allowZero: true }),
+    geometryTolerancePx: positiveNumber(raw.geometryTolerancePx ?? 2, `${label}.geometryTolerancePx`, { allowZero: true }),
+    activation,
   };
+}
+
+export function actionRequiresForeground(action) {
+  if (['click', 'drag'].includes(action.command)) return true;
+  if (action.command === 'send-keys') return action.via !== 'post-message';
+  if (action.command === 'scroll') return action.wheel !== undefined;
+  if (action.command === 'screenshot') return action.captureScreen === true;
+  return false;
 }
 
 function normalizePoint(raw, label) {
@@ -201,6 +233,7 @@ function normalizeAction(raw, index, preserveGeometry) {
   if (!COMMANDS.has(command)) throw new Error(`${id} has unsupported command: ${command}`);
   if (command === 'pause') {
     return {
+      window: raw.window ? safeId(raw.window, `${id}.window`) : '',
       id,
       command,
       durationMs: positiveNumber(raw.durationMs ?? 100, `${id}.durationMs`, { allowZero: true }),
@@ -228,6 +261,19 @@ function normalizeAction(raw, index, preserveGeometry) {
   if (command === 'send-keys' && raw.keys === undefined && !raw.valueFrom) {
     throw new Error(`${id} requires keys or valueFrom`);
   }
+  if (command === 'extract-regex') {
+    if (!raw.sourceFrom || !raw.pattern || !raw.saveAs) {
+      throw new Error(`${id} requires sourceFrom, pattern, and saveAs`);
+    }
+    try {
+      new RegExp(raw.pattern, raw.flags ?? '');
+    } catch (error) {
+      throw new Error(`${id} has an invalid regular expression: ${error.message}`);
+    }
+  }
+  if (command === 'template' && (!raw.template || !raw.saveAs)) {
+    throw new Error(`${id} requires template and saveAs`);
+  }
   if (READ_COMMANDS.has(command) && raw.saveAs) safeId(raw.saveAs, `${id}.saveAs`);
   return action;
 }
@@ -253,13 +299,24 @@ function normalizeWorkflow(raw) {
 
 export function validateDesktopPlan(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Plan must be an object');
-  const target = normalizeTarget(raw.target);
+  const rawTargets = raw.targets
+    ? Object.entries(raw.targets)
+    : [['default', { ...(raw.target ?? {}), activation: raw.activation ?? raw.target?.activation }]];
+  if (rawTargets.length === 0) throw new Error('Plan requires at least one target window');
+  const targets = Object.fromEntries(rawTargets.map(([name, target]) => {
+    const id = safeId(name, 'target name');
+    return [id, normalizeTarget(target, `targets.${id}`)];
+  }));
+  const defaultTarget = Object.keys(targets)[0];
   if (!Array.isArray(raw.actions) || raw.actions.length === 0) {
     throw new Error('Plan requires a non-empty actions array');
   }
   const ids = new Set();
   const actions = raw.actions.map((action, index) => {
-    const normalized = normalizeAction(action, index, target.preserveGeometry);
+    const windowName = action.window ? safeId(action.window, 'action window') : defaultTarget;
+    if (!targets[windowName]) throw new Error(`Unknown action window: ${windowName}`);
+    const normalized = normalizeAction(action, index, targets[windowName].preserveGeometry);
+    normalized.window = windowName;
     if (ids.has(normalized.id)) throw new Error(`Duplicate action id: ${normalized.id}`);
     ids.add(normalized.id);
     return normalized;
@@ -268,18 +325,23 @@ export function validateDesktopPlan(raw) {
   if (!['boundary', 'failure', 'none'].includes(screenshotPolicy)) {
     throw new Error('evidence.screenshot must be boundary, failure, or none');
   }
+  const evidenceWindow = raw.evidence?.window
+    ? safeId(raw.evidence.window, 'evidence.window')
+    : actions.at(-1).window;
+  if (!targets[evidenceWindow]) throw new Error(`Unknown evidence window: ${evidenceWindow}`);
   return {
     schemaVersion: 1,
     id: safeId(raw.id ?? 'desktop-transaction', 'plan id'),
     description: String(raw.description ?? ''),
-    target,
-    activation: raw.activation ?? null,
+    targets,
+    defaultTarget,
     actions,
     workflow: normalizeWorkflow(raw.workflow),
     boundary: raw.boundary ?? null,
     evidence: {
       screenshot: screenshotPolicy,
       file: raw.evidence?.file ? String(raw.evidence.file) : '',
+      window: evidenceWindow,
     },
   };
 }
@@ -356,6 +418,14 @@ function scalarValue(action, values) {
   return value;
 }
 
+function templateValue(template, values) {
+  return String(template).replaceAll(/\$\{([^}]+)\}/g, (_, key) => {
+    const value = nestedValue(values, key.trim());
+    if (value === undefined) throw new Error(`Template value is missing: ${key.trim()}`);
+    return typeof value === 'object' ? JSON.stringify(value) : String(value);
+  });
+}
+
 function pointArgument(point, rectangle) {
   if (point.space === 'selector' || point.space === 'screen') return point.value;
   const resolved = resolveRelativePoint(point.value, rectangle);
@@ -368,6 +438,21 @@ async function executeAction(action, context) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, action.durationMs));
     return { durationMs: action.durationMs };
   }
+  if (action.command === 'window-info') {
+    const current = await resolveWindow(context.target);
+    return { ...current, rectangle: context.rectangle };
+  }
+  if (action.command === 'extract-regex') {
+    const source = nestedValue(values, action.sourceFrom);
+    if (source === undefined) throw new Error(`Regex source is missing: ${action.sourceFrom}`);
+    const match = String(source).match(new RegExp(action.pattern, action.flags ?? ''));
+    if (!match) throw new Error(`Regex did not match ${action.sourceFrom}`);
+    return match.groups ?? {
+      match: match[0],
+      captures: match.slice(1),
+    };
+  }
+  if (action.command === 'template') return templateValue(action.template, values);
   const args = [action.command];
   if (action.command === 'click' && action.point) {
     const point = pointArgument(action.point, rectangle);
@@ -406,11 +491,17 @@ async function executeAction(action, context) {
     if (action.wheel !== undefined) args.push('--wheel', String(action.wheel));
   } else if (action.command === 'screenshot') {
     if (action.selector) args.push(String(action.selector));
-    const output = runScopedPath(action.output, context.runId, `${action.id}.output`);
+    if (!action.output) throw new Error(`${action.id}.output is required`);
+    const output = artifactPath(
+      action.output,
+      context.runId,
+      'diagnostics',
+      context.planId,
+      `${action.id}.output`,
+    );
     await mkdir(dirname(output), { recursive: true });
     args.push('--output', output);
     if (action.captureScreen) args.push('--capture-screen');
-    if (action.focus !== false) args.push('--focus');
   }
   args.push(...targetArgs(hwnd));
   return runWinApp(args);
@@ -420,21 +511,33 @@ function geometryChanged(before, after, tolerance) {
   return ['x', 'y', 'width', 'height'].some((key) => Math.abs(before[key] - after[key]) > tolerance);
 }
 
-async function boundaryScreenshot(plan, runId, hwnd, status) {
+function artifactRoot(runId, area, planId) {
+  return join(RUNS_ROOT, runId ?? 'desktop-evidence', area, planId);
+}
+
+function artifactPath(value, runId, area, planId, label) {
+  const absolute = value
+    ? runScopedPath(value, runId, label)
+    : join(artifactRoot(runId, area, planId), `${planId}.png`);
+  const allowedRoot = artifactRoot(runId, area, planId);
+  const fromAllowed = relative(allowedRoot, absolute);
+  if (fromAllowed.startsWith('..') || isAbsolute(fromAllowed)) {
+    throw new Error(`${label} must be inside ${relative(ROOT, allowedRoot).replaceAll('\\', '/')}`);
+  }
+  return absolute;
+}
+
+async function boundaryScreenshot(plan, runId, context, status) {
   const shouldCapture = plan.evidence.screenshot === 'boundary'
     || (plan.evidence.screenshot === 'failure' && status === 'failure');
   if (!shouldCapture) return null;
-  const fallback = join(
-    '.workflow-runs',
-    runId ?? 'desktop-evidence',
-    `${plan.id}-${status}.png`,
-  );
-  const output = runScopedPath(plan.evidence.file || fallback, runId, 'evidence.file');
+  const area = status === 'success' ? 'evidence' : 'diagnostics';
+  const explicit = status === 'success' ? plan.evidence.file : '';
+  const output = artifactPath(explicit, runId, area, plan.id, 'evidence.file');
   await mkdir(dirname(output), { recursive: true });
   const result = await runWinApp([
     'screenshot',
-    '-w', String(hwnd),
-    '--focus',
+    '-w', String(context.window.hwnd),
     '--output', output,
   ]);
   return result.filePath ?? output;
@@ -526,27 +629,36 @@ async function writeWorkflowBoundary(plan, runId, result) {
   return relative(ROOT, path).replaceAll('\\', '/');
 }
 
-async function activate(plan, hwnd) {
-  if (!plan.activation) return;
-  const action = normalizeAction({
-    id: 'activate-window',
-    command: 'send-keys',
-    ...plan.activation,
-  }, 0, false);
-  await executeAction(action, {
-    hwnd,
-    rectangle: await windowRectangle(hwnd),
-    values: {},
-    runId: null,
+async function prepareTarget(plan, name) {
+  const target = plan.targets[name];
+  let window = await resolveWindow(target);
+  let activation = null;
+  if (target.activation && target.activation.mode !== 'auto') {
+    activation = await activateWindow(window.hwnd, {
+      restore: target.activation.mode === 'restore',
+      timeoutMs: target.activation.timeoutMs,
+    });
+    window = await resolveWindow(target);
+  }
+  return {
+    name,
+    target,
+    window,
+    activation,
+    rectangle: await windowRectangle(window.hwnd),
+  };
+}
+
+async function ensureForeground(context) {
+  if (!context.target.activation || context.activation?.foreground) return context;
+  const activation = await activateWindow(context.window.hwnd, {
+    restore: context.target.activation.mode !== 'activate',
+    timeoutMs: context.target.activation.timeoutMs,
   });
-  const timeoutMs = positiveNumber(plan.activation.timeoutMs ?? 5000, 'activation.timeoutMs');
-  const deadline = Date.now() + timeoutMs;
-  do {
-    const window = await resolveWindow(plan.target).catch(() => null);
-    if (window && window.width > 100 && window.height > 100) return;
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
-  } while (Date.now() <= deadline);
-  throw new Error('Target window did not become interactive after activation');
+  context.window = await resolveWindow(context.target);
+  context.activation = activation;
+  if (activation.restored) context.rectangle = await windowRectangle(context.window.hwnd);
+  return context;
 }
 
 async function main() {
@@ -562,24 +674,29 @@ async function main() {
     return;
   }
   const values = await loadRuntimeValues(runId, parseAssignments(flags.input ?? []));
-  let window = await resolveWindow(plan.target);
-  await activate(plan, window.hwnd);
-  window = await resolveWindow(plan.target);
-  const rectangle = await windowRectangle(window.hwnd);
   const startedAt = new Date().toISOString();
   const started = Date.now();
   const results = [];
   const observations = {};
+  values.observations = observations;
+  const contexts = new Map();
+  const contextFor = async (name) => {
+    if (!contexts.has(name)) contexts.set(name, await prepareTarget(plan, name));
+    return contexts.get(name);
+  };
   let failure = null;
   for (const action of plan.actions) {
     const actionStartedAt = new Date().toISOString();
     const actionStarted = Date.now();
     try {
+      let context = await contextFor(action.window);
+      if (actionRequiresForeground(action)) context = await ensureForeground(context);
       const output = await executeAction(action, {
-        hwnd: window.hwnd,
-        rectangle,
+        ...context,
+        hwnd: context.window.hwnd,
         values,
         runId,
+        planId: plan.id,
       });
       if (READ_COMMANDS.has(action.command) && action.saveAs) {
         observations[action.saveAs] = output;
@@ -587,16 +704,23 @@ async function main() {
       results.push({
         id: action.id,
         command: action.command,
+        window: action.window,
         status: 'success',
         startedAt: actionStartedAt,
         endedAt: new Date().toISOString(),
         durationMs: Date.now() - actionStarted,
       });
     } catch (error) {
-      failure = { actionId: action.id, command: action.command, reason: error.message };
+      failure = {
+        actionId: action.id,
+        command: action.command,
+        window: action.window,
+        reason: error.message,
+      };
       results.push({
         id: action.id,
         command: action.command,
+        window: action.window,
         status: 'failure',
         reason: error.message,
         startedAt: actionStartedAt,
@@ -606,36 +730,50 @@ async function main() {
       break;
     }
   }
-  let finalRectangle = null;
-  if (!failure && plan.target.preserveGeometry) {
-    finalRectangle = await windowRectangle(window.hwnd);
-    if (geometryChanged(rectangle, finalRectangle, plan.target.geometryTolerancePx)) {
-      failure = {
-        actionId: 'boundary',
-        command: 'geometry-check',
-        reason: `Window geometry changed from ${JSON.stringify(rectangle)} to ${JSON.stringify(finalRectangle)}`,
-      };
+  const geometry = {};
+  if (!failure) {
+    for (const [name, context] of contexts) {
+      const after = await windowRectangle(context.window.hwnd);
+      const preserved = !context.target.preserveGeometry
+        || !geometryChanged(context.rectangle, after, context.target.geometryTolerancePx);
+      geometry[name] = { before: context.rectangle, after, preserved };
+      if (!preserved) {
+        failure = {
+          actionId: 'boundary',
+          command: 'geometry-check',
+          window: name,
+          reason: `Window geometry changed from ${JSON.stringify(context.rectangle)} to ${JSON.stringify(after)}`,
+        };
+        break;
+      }
     }
   }
   const status = failure ? 'failure' : 'success';
-  const screenshot = await boundaryScreenshot(plan, runId, window.hwnd, status).catch((error) => {
+  const screenshotWindow = status === 'failure'
+    ? failure?.window ?? results.at(-1)?.window ?? plan.defaultTarget
+    : plan.evidence.window;
+  const evidenceContext = contexts.get(screenshotWindow)
+    ?? await contextFor(plan.defaultTarget);
+  const screenshot = await boundaryScreenshot(plan, runId, evidenceContext, status).catch((error) => {
     failure ??= { actionId: 'boundary', command: 'screenshot', reason: error.message };
     return null;
   });
+  if (!failure) {
+    await rm(artifactRoot(runId, 'diagnostics', plan.id), { recursive: true, force: true });
+  }
+  const targetResults = Object.fromEntries([...contexts].map(([name, context]) => [name, {
+    hwnd: context.window.hwnd,
+    processName: context.window.processName,
+    title: context.window.title,
+    className: context.window.className,
+    activation: context.activation,
+  }]));
   const result = {
     status: failure ? 'failure' : 'success',
     planId: plan.id,
-    target: {
-      hwnd: window.hwnd,
-      processName: window.processName,
-      title: window.title,
-      className: window.className,
-    },
-    geometry: {
-      before: rectangle,
-      after: finalRectangle ?? rectangle,
-      preserved: !failure || failure.command !== 'geometry-check',
-    },
+    target: targetResults[plan.defaultTarget],
+    targets: targetResults,
+    geometry,
     results,
     observations,
     evidence: { screenshot },
